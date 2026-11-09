@@ -1988,9 +1988,19 @@ def config_toolkit(cfg: dict) -> int:
     return 12 if cfg.get("cuda") == 12 or Path(str(cfg.get("exe", ""))).parent.name == ENGINE12_DIR else 13
 
 
+def installed_engine_has_code(arch) -> bool:
+    """An engine package in the component folder holds machine code for this card (a source build with the card's architecture,
+    packaged by hand): the card then needs no opt-in.  No ready-made package holds code below sm_75, so a stock install is unchanged."""
+    try:
+        found, _ = engine_component.scan()
+    except Exception:                                   # noqa: BLE001
+        return False
+    return any(f"sm_{int(arch)}" in item.cuda_archs for item in found)
+
+
 def gpu_problem(g, together=False):
     """Why Strata cannot use this card, in plain words (None: it can)."""
-    if int(g["arch"]) < 75 and not ((sm60_card(g["arch"]) or maxwell_card(g["arch"])) and experimental_sm60()):
+    if int(g["arch"]) < 75 and not ((sm60_card(g["arch"]) or maxwell_card(g["arch"])) and (experimental_sm60() or installed_engine_has_code(g["arch"]))):
         return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; Strata needs 7.5 or "
                 "newer" + ("; experimental: choose it with --gpu " + str(g["index"]) + " (the CUDA 12 engine, "
                           "docs/OLDER_GPUS.md)" if sm60_card(g["arch"]) else
