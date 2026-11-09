@@ -23,6 +23,10 @@
 > loads in L1, which these kernels need. ISTA-DAS Coder pack, 31 GB RAM, same coding request: RTX 3090 + M6000 8.97 tok/s, 3090 alone
 > 7.22, M6000 alone 5.57. Report with charts: **https://volko61.github.io/Strata/** (also [reports/deepseek-3090-m6000.html](reports/deepseek-3090-m6000.html)).
 >
+> **Tesla V100 (sm_70) beside an RTX 3090.** Add `70` to the architectures (`-DCMAKE_CUDA_ARCHITECTURES="52;70;86"` builds for Maxwell, Volta
+> and Ampere). V100 32 GB + RTX 3090, 31 GB RAM, same coding request: DeepSeek V4.1 (ISTA-DAS Coder) 20-24 tok/s on both cards, 10.5-11.6 on the
+> V100 alone, 7.1-7.8 on the 3090 alone; Qwen Coder IQ1_M 92-93 on both, 84 on the V100 alone, 101-110 on the 3090 alone.
+>
 > **NVIDIA CMP 170HX (sm_80, GA100), stock or unlocked, and DeepSeek V4.1.** No ready-made DeepSeek engine package holds code for
 > sm_80 (the packages are sm_86, sm_89, sm_120), so upstream stops with "DeepSeek's engine is not available for this computer yet". In
 > this fork, setup run from a source checkout compiles `strata-dsv41` for such a card itself and uses it (`engine/strata-dsv41`, stamped
