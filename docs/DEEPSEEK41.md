@@ -243,6 +243,33 @@ python setup.py --family deepseek41 --model ISTA-DAS-2.00bpw
 `strata-dsv41 --version` prints the commit it was built from. A build you made yourself is not signed by Strata, which is fine for your own computer.
 Please tell us how it runs on your card (the speed, and the card and RAM): we only list a card as tested after someone has run it.
 
+## Splitting the layers by card speed (this fork, opt-in)
+
+By default the engine gives each card layers in proportion to its free graphics memory, so a slow card (a Quadro M6000 next to an RTX 3090)
+runs as many layers per GB as the fast one. `DS4_SPLIT_SPEED` splits by speed as well as memory. It needs `--tp 1` (one card per group).
+
+1. Start once with `DS4_PROF=1` and let it answer a few hundred tokens. At the end the log has one line per card and the numbers to use:
+
+   ```
+     CUDA0: 10 trunk layers from 0, dense work 2.10 ms a token for 4.20 GB of weights: 2000 GB/s
+     ...
+     for a split by speed (--tp 1, the same --gpus): DS4_SPLIT_SPEED=2000,1600,350,350 DS4_SPLIT_CPU_GBS=22
+   ```
+
+   (Illustrative numbers. Your log gives your own.)
+
+2. Start with those two variables set. The engine picks the contiguous split with the lowest estimated time a token and prints it next to the
+   memory split's estimate. It keeps the memory split when that already wins.
+
+The estimate: a token passes every layer once, so it adds each card's dense weights at its speed, plus its experts. Each card's experts are
+either in its VRAM at its speed or on the CPU lane at `DS4_SPLIT_CPU_GBS`, whichever finishes later, because the lane runs beside the card.
+CPU-lane experts beyond the RAM the engine sees are read from the SSD at `DS4_SPLIT_DISK_GBS` (3 by default). With little RAM the slow
+cards keep their experts; with plenty of RAM, layers move to the fast cards.
+
+It optimises answers (decode), not prompt reading. It assumes an expert in VRAM is hit in proportion to their share there, while the engine
+keeps the hottest ones there, so it undercounts hits. It has not been run on a GPU: compare tokens a second with and without it.
+`DS4_SPLIT=a,b,..` (layer counts by hand) still wins over it. The choice itself is tested without a GPU: `ds4_split_speed_test`.
+
 ## Compressed experts (trellis), for testing
 
 `strata-dsv41` reads the routed experts in the trellis types as well as the source MXFP4: TQK6 and TQK7 (agentionai's files), and the

@@ -16,6 +16,7 @@
 #include "ds4_ring_link.hpp"
 #include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_model.hpp"
+#include "ds4_split_speed.hpp"
 #include "ds4_pick_rule.hpp"
 #include "ds4_experts_rule.hpp"
 #include "ds4_engram_io.hpp"
@@ -1781,6 +1782,7 @@ struct Model::Impl {
         const bool chunk_sample = prof_chunk;
         bool sample_ok = !prof_failed;
         double sample_ms[6] = {};
+        double sample_dev[16] = {};   // (decode: each device's attention + routing / shared expert, for the speed readout)
         std::vector<std::pair<int, cudaEvent_t>> last;
         int current_dev = -1;
         if (sample_ok) {
@@ -1811,6 +1813,7 @@ struct Model::Impl {
                         break;
                     }
                     sample_ms[m.stage] += ms;
+                    if (!chunk_sample && (m.stage == 1 || m.stage == 2) && m.dev < 16) sample_dev[m.dev] += ms;
                     it->second = m.ev;
                 } else {
                     last.push_back({m.dev, m.ev});
@@ -1821,6 +1824,8 @@ struct Model::Impl {
             double* total = chunk_sample ? cprof_ms : st.prof_ms;
             const int stages = chunk_sample ? 4 : 6;
             for (int i = 0; i < stages; ++i) total[i] += sample_ms[i];
+            if (!chunk_sample)
+                for (int i = 0; i < 16; ++i) st.prof_dev_ms[i] += sample_dev[i];
             for (const ProfMark& m : prof_marks) prof_pool[(size_t) m.dev].push_back(m.ev);
             prof_marks.clear();
             if (!chunk_sample) ++st.prof_tokens;
@@ -3035,6 +3040,76 @@ struct Model::Impl {
                     b = a;
                 }
             }
+            // DS4_SPLIT_SPEED=s0,s1,.. (this fork, opt-in): the contiguous split by each card's speed as well as its memory.  The memory split
+            // above gives each card layers in proportion to its free VRAM, so a slow card (a Maxwell M6000 beside an RTX 3090) runs as many
+            // layers per GB as the fast one.  Here s_g is group g's speed on the dense work in GB/s (the DS4_PROF readout prints it per card)
+            // and DS4_SPLIT_CPU_GBS the CPU lane's; a token's decode passes every layer once, so the split minimises the SUM over the groups of
+            //   dense weights / s_g + max(the experts' share in its VRAM / s_g, the share left to the CPU lane / s_cpu)
+            // with a group's spare VRAM (after its dense weights) spread over its layers' experts.  An expert in VRAM is counted as hit in
+            // proportion to the share of them there (the engine puts the hottest there, so this undercounts the hits).  Groups of one card
+            // only (--tp 1): a tensor parallel group's speed is its slowest member's and is not modelled.  DS4_SPLIT wins over it.
+            if (const char* ss = std::getenv("DS4_SPLIT_SPEED"); ss != nullptr && *ss != '\0' && std::getenv("DS4_SPLIT") == nullptr &&
+                                                                 groups.size() > 1) {
+                std::vector<double> sp;
+                for (const char* q = ss; *q;) {
+                    sp.push_back(std::atof(q));
+                    while (*q && *q != ',') ++q;
+                    if (*q == ',') ++q;
+                }
+                bool one = true;
+                for (const Group& gr : groups) one = one && gr.mem.size() == 1;
+                bool pos = true;
+                for (double v : sp) pos = pos && v > 0;
+                const char* cs = std::getenv("DS4_SPLIT_CPU_GBS");
+                const double scpu = cs != nullptr && std::atof(cs) > 0 ? std::atof(cs) : 20.0;
+                if (!one)
+                    std::fprintf(stderr, "ds4: DS4_SPLIT_SPEED: not used - a group has more than one card (tensor parallel); start with --tp 1\n");
+                else if (sp.size() != groups.size() || !pos)
+                    std::fprintf(stderr, "ds4: DS4_SPLIT_SPEED: not used - it needs %zu positive numbers (one per card, in --gpus order), got \"%s\"\n",
+                                 groups.size(), ss);
+                else {
+                    if (cs == nullptr)
+                        std::fprintf(stderr, "ds4: DS4_SPLIT_SPEED: DS4_SPLIT_CPU_GBS is not set, the CPU lane is taken as 20 GB/s (a DS4_PROF run "
+                                             "prints this PC's figure)\n");
+                    const int G = (int) groups.size(), NL = g.nl;
+                    const double ring = (double) g.win * (double) win_rb() + (double) (2u << 20);
+                    std::vector<double> cap((size_t) G);
+                    for (int gi = 0; gi < G; ++gi)
+                        cap[(size_t) gi] = std::max(0.0, (double) devs[(size_t) groups[(size_t) gi].mem[0]].free0 - (double) per_dev_fixed -
+                                                             400.0 * (1 << 20) - (chunk > 0 ? 1.1 * (1 << 30) : 0.0));
+                    for (const Layer& l : L)
+                        if (l.mtp) cap[0] -= (double) l.dense_bytes + (double) l.blob * l.n_exp;
+                    cap[(size_t) G - 1] -= (double) head_b;
+                    std::vector<ds4split::LayerBytes> lb((size_t) NL);
+                    std::vector<int> before((size_t) NL);
+                    for (int il = 0; il < NL; ++il) {
+                        const Layer& l = L[(size_t) il];
+                        lb[(size_t) il] = {(double) l.dense_bytes, (double) l.blob * l.n_exp, std::max(0.0, (double) l.dense_bytes - ring),
+                                           (double) l.blob * l.k_exp};
+                        before[(size_t) il] = l.grp;
+                    }
+                    // the RAM the CPU lane's experts may stay cached in (past it they are read from the SSD at DS4_SPLIT_DISK_GBS, 3 by default)
+                    const double ram_b = std::max(0.0, (double) ram_avail() - (double) kRamMargin);
+                    const char* ds = std::getenv("DS4_SPLIT_DISK_GBS");
+                    const double sdisk = ds != nullptr && std::atof(ds) > 0 ? std::atof(ds) : 3.0;
+                    const ds4split::Model sm(lb, cap, sp, scpu, ram_b, sdisk);
+                    const ds4split::Result r = sm.best(before);
+                    if (!r.ok)
+                        std::fprintf(stderr, "ds4: DS4_SPLIT_SPEED: no split keeps every card's dense weights in its VRAM; the memory split stays\n");
+                    else {
+                        std::string desc;
+                        for (int gi = 0; gi < G; ++gi)
+                            desc += (gi ? "," : "") + std::to_string(std::count(r.grp.begin(), r.grp.end(), gi));
+                        if (r.t_after < r.t_before) {
+                            for (int il = 0; il < NL; ++il) L[(size_t) il].grp = r.grp[(size_t) il];
+                            std::fprintf(stderr, "ds4: DS4_SPLIT_SPEED: trunk layers per card %s (the model's estimate of a token: %.1f ms, "
+                                                 "the memory split's %.1f ms)\n", desc.c_str(), r.t_after * 1e3, r.t_before * 1e3);
+                        } else
+                            std::fprintf(stderr, "ds4: DS4_SPLIT_SPEED: the memory split is already the estimate's best (%.1f ms a token); kept\n",
+                                         r.t_before * 1e3);
+                    }
+                }
+            }
             // DS4_SPLIT=a,b,..: the trunk layers each group takes (the drafter stays with the first)
             if (const char* sp = std::getenv("DS4_SPLIT")) {
                 std::vector<int> n;
@@ -3054,6 +3129,22 @@ struct Model::Impl {
             }
             head_dev = L[(size_t) g.nl - 1].dev;
             d_dev = g.n_mtp > 0 ? L[(size_t) g.nl].dev : 0;
+        }
+        {   // what each card holds, for the DS4_PROF speed readout (ds4_main.cpp)
+            const double ring = (double) g.win * (double) win_rb() + (double) (2u << 20);
+            double bsum = 0;
+            int bn = 0;
+            for (const Layer& l : L) {
+                if (l.mtp || l.nm != 1) continue;
+                const int id = devs[(size_t) l.dev].id;
+                if (id < 0 || id >= 16) continue;
+                st.split_dev_wgb[id] += std::max(0.0, (double) l.dense_bytes - ring) / 1e9;
+                if (st.split_dev_first[id] < 0) st.split_dev_first[id] = l.il;
+                ++st.split_dev_layers[id];
+                bsum += (double) l.blob;
+                ++bn;
+            }
+            st.expert_gb = bn > 0 ? bsum / bn / 1e9 : 0.0;
         }
         // the dense weights (attention, the shared experts, the head) always live in VRAM - only the routed experts
         // can go to RAM, the CPU lane or the disk - so a GPU whose free memory cannot hold its layers' dense weights

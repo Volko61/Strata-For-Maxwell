@@ -99,6 +99,14 @@ struct Stats {
     int64_t ram_experts = 0, ram_moves = 0;   // CPU-lane experts read from the RAM tier; experts moved into it
     double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
     int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
+    // DS4_PROF, per CUDA device id (< 16): the decode's dense work (attention + routing and the shared expert, stages 1 and 2) in ms, and
+    // what the load put there: the dense weights a token reads on it (GB), its first trunk layer (-1: none), its trunk layers.  With the
+    // CPU lane's figures below this gives each card's speed in GB/s - the numbers DS4_SPLIT_SPEED / DS4_SPLIT_CPU_GBS take (this fork).
+    double prof_dev_ms[16] = {};
+    double split_dev_wgb[16] = {};
+    int split_dev_first[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+    int split_dev_layers[16] = {};
+    double expert_gb = 0.0;           // one routed expert's blob (GB, the trunk's mean): what the CPU lane reads for one pick
     // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this
     // layer's FFN input), of them in the guess's top k / in all its guesses / in the guess two layers before; the picks
     // read from the files, of them prefetched early; experts prefetched early

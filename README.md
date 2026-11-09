@@ -38,6 +38,10 @@
 > unlock is lost at power-off, and a plan made for 40 GB on a card back at 10 GB runs out of memory. The 170HX's PCIe link is narrow
 > (Gen1/Gen2 x4 on most cards), so experts left in RAM are slow to reach. Built here for sm_80 with CUDA 12.9 (it compiles); not run
 > on a CMP 170HX by us, so no speed is claimed.
+>
+> **Layer split by card speed (DeepSeek, opt-in).** `DS4_SPLIT_SPEED` / `DS4_SPLIT_CPU_GBS` make `strata-dsv41` split layers by each card's
+> speed and the CPU lane's, not by memory alone; a `DS4_PROF=1` run prints the numbers. See
+> [DEEPSEEK41.md](docs/DEEPSEEK41.md#splitting-the-layers-by-card-speed-this-fork-opt-in). Not run on a GPU yet.
 
 <p align="center">
   <picture>

@@ -2858,6 +2858,31 @@ int main(int argc, char** argv) {
                      (s.prof_ms[0] - s0.prof_ms[0]) / pt, (s.prof_ms[1] - s0.prof_ms[1]) / pt,
                      (s.prof_ms[2] - s0.prof_ms[2]) / pt, (s.prof_ms[3] - s0.prof_ms[3]) / pt,
                      (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt);
+        // this fork: each card's speed on the dense work (attention + routing / shared expert), in trunk-layer order - the numbers
+        // DS4_SPLIT_SPEED takes - and the CPU lane's (DS4_SPLIT_CPU_GBS)
+        std::vector<int> ids;
+        for (int i = 0; i < 16; ++i)
+            if (s.split_dev_first[i] >= 0 && s.split_dev_wgb[i] > 0 && s.prof_dev_ms[i] - s0.prof_dev_ms[i] > 0) ids.push_back(i);
+        std::sort(ids.begin(), ids.end(), [&](int a, int b) { return s.split_dev_first[a] < s.split_dev_first[b]; });
+        std::string speeds;
+        for (int i : ids) {
+            const double ms = (s.prof_dev_ms[i] - s0.prof_dev_ms[i]) / pt, gbs = s.split_dev_wgb[i] / (ms / 1e3);
+            std::fprintf(stderr, "  CUDA%d: %d trunk layers from %d, dense work %.2f ms a token for %.2f GB of weights: %.0f GB/s\n", i,
+                         s.split_dev_layers[i], s.split_dev_first[i], ms, s.split_dev_wgb[i], gbs);
+            char b[32];
+            std::snprintf(b, sizeof b, "%s%.0f", speeds.empty() ? "" : ",", gbs);
+            speeds += b;
+        }
+        const double cms = s.cpu_ms - s0.cpu_ms;
+        const int64_t ce = s.cpu_experts - s0.cpu_experts;
+        std::string cpu;
+        if (cms > 0 && ce > 0 && s.expert_gb > 0) {
+            char b[96];
+            std::snprintf(b, sizeof b, " DS4_SPLIT_CPU_GBS=%.0f", (double) ce * s.expert_gb / (cms / 1e3));
+            cpu = b;
+        }
+        if (ids.size() > 1)
+            std::fprintf(stderr, "  for a split by speed (--tp 1, the same --gpus): DS4_SPLIT_SPEED=%s%s\n", speeds.c_str(), cpu.c_str());
     }
     if (df != nullptr) std::fclose(df);
     m.save_profile();
