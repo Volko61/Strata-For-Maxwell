@@ -2726,7 +2726,9 @@ struct Model::Impl {
             // this fork (opt-in, DS4_TP_UNEVEN=1): where only the experts' blocks stand in the way (n_ff an odd number of them), the
             // members take unequal shares in whole blocks (split128 with the block's size) and the group keeps its width
             const bool uneven_ok = std::getenv("DS4_TP_UNEVEN") != nullptr && std::atoi(std::getenv("DS4_TP_UNEVEN")) != 0;
-            if (uneven_ok && tp > 1 && blk >= 128 && blk % 128 == 0 && g.ff % blk == 0 && g.ff / blk >= tp && (g.ff / tp) % blk != 0 &&
+            // (groups of two only: measured on 4 Tesla V100 with the ISTA-DAS Coder, a group of two gave the right text and 81 tok/s
+            // against 61; one group of four - shares of 3, 2, 2, 2 blocks - gave wrong text, so a wider group stays as it was)
+            if (uneven_ok && tp == 2 && blk >= 128 && blk % 128 == 0 && g.ff % blk == 0 && g.ff / blk >= tp && (g.ff / tp) % blk != 0 &&
                 g.heads % tp == 0 && g.o_groups % tp == 0) {
                 g_ffsplit_whole = g.ff, g_ffsplit_blk = blk;
                 std::fprintf(stderr, "ds4: tensor parallel %d: the experts' %d-value blocks split n_ff %d unevenly (DS4_TP_UNEVEN), "
