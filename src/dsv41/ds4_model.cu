@@ -2064,8 +2064,12 @@ struct Model::Impl {
         return true;
     }
     // a dense matrix in a ggml block type (x3::Mat fmt kFmtGG, row = k / 256 blocks): whole, or part of its rows / inputs
+    // (this fork, DS4_TP_UNEVEN: the shared expert's n_ff side takes the members' uneven shares, as the routed experts do)
+    static bool ff_uneven(const std::string& pre, int whole, int np) {
+        return np > 1 && g_ffsplit_whole > 0 && whole == g_ffsplit_whole && pre.find("ffn.shared_experts") != std::string::npos;
+    }
     bool mat_gg(Dev& d, const std::string& pre, const Tensor& t, int ggt, x3::Mat& m, std::string& err, size_t* acct, int part,
-                int np, bool cols) {
+                int np, bool cols, int rot = 0) {
         if (t.shape.size() != 2 || t.shape[1] % 256 != 0) {
             err = pre + ": a " + t.dtype + " tensor that is not a matrix of whole blocks";
             return false;
@@ -2078,17 +2082,19 @@ struct Model::Impl {
             return false;
         }
         if (np > 1) {
-            const int whole = cols ? n : k, wd = whole / np;
-            if (whole % np != 0 || wd % (cols ? 1 : 256) != 0) {
+            const int whole = cols ? n : k;
+            int wd = whole / np, p0 = part * wd;
+            if (ff_uneven(pre, whole, np)) split128(whole, np, part, p0, wd, rot);
+            else if (whole % np != 0 || wd % (cols ? 1 : 256) != 0) {
                 err = pre + ": " + std::to_string(whole) + (cols ? " outputs" : " inputs") + " do not split in " + std::to_string(np) + " parts";
                 return false;
             }
             std::vector<uint8_t> p;
             if (cols) {
-                p.assign(w.begin() + (long) ((size_t) part * wd * rb), w.begin() + (long) ((size_t) (part + 1) * wd * rb));
+                p.assign(w.begin() + (long) ((size_t) p0 * rb), w.begin() + (long) ((size_t) (p0 + wd) * rb));
                 n = wd;
             } else {
-                const size_t pb = (size_t) (wd / 256) * bb, off = (size_t) (part * wd / 256) * bb;
+                const size_t pb = (size_t) (wd / 256) * bb, off = (size_t) (p0 / 256) * bb;
                 p.resize((size_t) n * pb);
                 for (size_t r = 0; r < (size_t) n; ++r) std::memcpy(p.data() + r * pb, w.data() + r * rb + off, pb);
                 k = wd;
@@ -2112,11 +2118,11 @@ struct Model::Impl {
     // columns (outputs: a range of its rows) or of its rows (inputs: a range of each row, whole Q8_0 blocks) - a
     // standalone [n][k] matrix
     bool mat_bf16(Dev& d, const std::string& pre, const Tensor& t, x3::Mat& m, std::string& err, size_t* acct, int part,
-                  int np, bool cols) {
+                  int np, bool cols, int rot = 0) {
         const bool q8 = t.dtype == "Q8_0";
         // a ggml K-quant dense matrix (Q4_K / Q5_K / Q6_K: 256 values a block; the GEMV path of ds4_iq)
         const int ggt = (t.dtype == "Q4_K" || t.dtype == "Q5_K" || t.dtype == "Q6_K") ? gg_type_of(t.dtype) : -1;
-        if (ggt > 0) return mat_gg(d, pre, t, ggt, m, err, acct, part, np, cols);
+        if (ggt > 0) return mat_gg(d, pre, t, ggt, m, err, acct, part, np, cols, rot);
         if (t.shape.size() != 2 || (q8 && t.shape[1] % 32 != 0)) {
             err = pre + ": a " + t.dtype + " tensor that is not a matrix";
             return false;
@@ -2130,8 +2136,10 @@ struct Model::Impl {
             return false;
         }
         if (np > 1) {
-            const int whole = cols ? n : k, wd = whole / np;
-            if (whole % np != 0 || wd % (q8 ? 32 : 8) != 0) {
+            const int whole = cols ? n : k;
+            int wd = whole / np, p0 = part * wd;
+            if (ff_uneven(pre, whole, np)) split128(whole, np, part, p0, wd, rot);
+            else if (whole % np != 0 || wd % (q8 ? 32 : 8) != 0) {
                 err = pre + ": " + std::to_string(whole) + (cols ? " outputs" : " inputs") + " do not split in " +
                       std::to_string(np) + " parts";
                 return false;
@@ -2139,13 +2147,13 @@ struct Model::Impl {
             const size_t rb = bytes_of((size_t) k);
             std::vector<uint8_t> p;
             if (cols) {
-                p.assign(w.begin() + (long) ((size_t) part * wd * rb), w.begin() + (long) ((size_t) (part + 1) * wd * rb));
+                p.assign(w.begin() + (long) ((size_t) p0 * rb), w.begin() + (long) ((size_t) (p0 + wd) * rb));
                 n = wd;
             } else {
                 const size_t pb = bytes_of((size_t) wd);
                 p.resize((size_t) n * pb);
                 for (size_t r = 0; r < (size_t) n; ++r)
-                    std::memcpy(p.data() + r * pb, w.data() + r * rb + bytes_of((size_t) part * wd), pb);
+                    std::memcpy(p.data() + r * pb, w.data() + r * rb + bytes_of((size_t) p0), pb);
                 k = wd;
             }
             w.swap(p);
@@ -2179,7 +2187,7 @@ struct Model::Impl {
     bool mat(Dev& d, const std::string& pre, x3::Mat& m, std::string& err, size_t* acct, int part = 0, int np = 1,
              bool cols = true, int rot = 0) {
         if (const Tensor* tw = pk.get(pre + ".weight"); tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0" || tw->dtype == "Q4_K" || tw->dtype == "Q5_K" || tw->dtype == "Q6_K"))
-            return mat_bf16(d, pre, *tw, m, err, acct, part, np, cols);
+            return mat_bf16(d, pre, *tw, m, err, acct, part, np, cols, rot);
         const Tensor* tr = pk.get(pre + ".trellis");
         const Tensor* su = pk.get(pre + ".suh");
         const Tensor* sv = pk.get(pre + ".svh");
