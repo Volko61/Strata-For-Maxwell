@@ -112,6 +112,86 @@ int env_tri(const char* name) {
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+// DS4_PROBE=<file> (opt-in): where each GPU is in the model, for a monitor.  The layer functions note the layer they
+// start (the chunked prompt pass or a decode window) and prof_mark the stage it reached; a thread writes them as one
+// JSON object to <file> (through <file>.tmp, renamed) every DS4_PROBE_MS (200).  Host-side: it is what the host has
+// queued on the card's stream, a little ahead of what the card computes.  Unset: nothing runs.
+namespace ds4_probe {
+struct PDev {
+    std::atomic<int> mode{0}, layer{-1}, stage{-1}, rows{0};          // mode 1: prompt chunk, 2: decode window
+    std::atomic<long long> last_us{0}, layers[2] = {}, rows_sum[2] = {};
+    std::atomic<long long> stage_us[2][12] = {}, stage_n[2][12] = {};
+};
+inline PDev g[16];
+inline const char* path() {
+    static const char* p = [] { const char* v = std::getenv("DS4_PROBE"); return v != nullptr && *v != '\0' ? v : nullptr; }();
+    return p;
+}
+inline long long us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+inline void writer() {
+    const char* ms = std::getenv("DS4_PROBE_MS");
+    const int every = std::max(50, ms != nullptr ? std::atoi(ms) : 200);
+    const std::string out = path(), tmp = out + ".tmp";
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(every));
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (f == nullptr) continue;
+        const long long now = us();
+        std::fprintf(f, "{\"t_us\":%lld,\"wall\":%.3f,\"devs\":[", now,
+                     std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count());
+        for (int d = 0; d < 16; ++d) {
+            PDev& x = g[d];
+            std::fprintf(f, "%s{\"mode\":%d,\"layer\":%d,\"stage\":%d,\"rows\":%d,\"idle_us\":%lld,\"layers\":[%lld,%lld],\"rows_sum\":[%lld,%lld],\"stage_us\":[",
+                         d ? "," : "", x.mode.load(), x.layer.load(), x.stage.load(), x.rows.load(),
+                         x.last_us.load() ? now - x.last_us.load() : -1, x.layers[0].load(), x.layers[1].load(),
+                         x.rows_sum[0].load(), x.rows_sum[1].load());
+            for (int m = 0; m < 2; ++m) {
+                std::fprintf(f, "%s[", m ? "," : "");
+                for (int k = 0; k < 12; ++k) std::fprintf(f, "%s%lld", k ? "," : "", x.stage_us[m][k].load());
+                std::fprintf(f, "]");
+            }
+            std::fprintf(f, "],\"stage_n\":[");
+            for (int m = 0; m < 2; ++m) {
+                std::fprintf(f, "%s[", m ? "," : "");
+                for (int k = 0; k < 12; ++k) std::fprintf(f, "%s%lld", k ? "," : "", x.stage_n[m][k].load());
+                std::fprintf(f, "]");
+            }
+            std::fprintf(f, "]}");
+        }
+        std::fprintf(f, "]}\n");
+        std::fclose(f);
+        std::rename(tmp.c_str(), out.c_str());
+    }
+}
+inline void start() {
+    static std::once_flag once;
+    std::call_once(once, [] { std::thread(writer).detach(); });
+}
+inline void layer(int dev, int mode, int il, int rows) {
+    if (path() == nullptr || dev < 0 || dev >= 16) return;
+    start();
+    PDev& x = g[dev];
+    x.mode.store(mode, std::memory_order_relaxed);
+    x.layer.store(il, std::memory_order_relaxed);
+    x.rows.store(rows, std::memory_order_relaxed);
+    x.layers[mode == 1 ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+    x.rows_sum[mode == 1 ? 0 : 1].fetch_add(rows, std::memory_order_relaxed);
+}
+inline void stage(int dev, int st) {
+    if (path() == nullptr || dev < 0 || dev >= 16) return;
+    PDev& x = g[dev];
+    const long long now = us(), prev = x.last_us.exchange(now, std::memory_order_relaxed);
+    const int m = x.mode.load(std::memory_order_relaxed) == 1 ? 0 : 1;
+    if (st >= 0 && st < 12) {
+        if (prev > 0 && now - prev < 5000000) x.stage_us[m][st].fetch_add(now - prev, std::memory_order_relaxed);
+        x.stage_n[m][st].fetch_add(1, std::memory_order_relaxed);
+    }
+    x.stage.store(st, std::memory_order_relaxed);
+}
+}   // namespace ds4_probe
 // rows past the chunk that the Metal expert tile may read (its 16-row load of the last partial tile); CUDA and HIP allocate none
 #if defined(STRATA_METAL)
 constexpr size_t kH16Pad = 16;
@@ -1710,6 +1790,7 @@ struct Model::Impl {
         return e;
     }
     void prof_mark(const Dev& d, int stage) {
+        ds4_probe::stage(d.id, stage);
         if (ds4_dbg("DS4_TLOG")) {   // the host's own phase times (what the GPU meters do not see)
             static double t_last = 0, acc[5] = {0, 0, 0, 0, 0}; static long n = 0; static bool reg = false;
             if (!reg) {
@@ -11518,6 +11599,7 @@ struct Model::Impl {
         Chunk& c = *chunks[(size_t) l.dev];
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
+        ds4_probe::layer(d.id, 1, l.il, T);
         prof_mark(d, 0);
         const int nm = L0.nm;
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
@@ -14118,6 +14200,7 @@ struct Model::Impl {
                          l.il, (int) l.dev, (void*) d.h, (long long) p0, T, toks.empty() ? -1 : toks[(size_t) p0],
                          hv.size() - (size_t) nzv - (size_t) nf, nf, mx, hv[0], hv.size() > 1 ? hv[1] : 0.0f, firstnan, lastnan);
         }
+        ds4_probe::layer(d.id, 2, l.il, T);
         prof_mark(d, 0);
         // Engram
         if (l.eg >= 0) {
