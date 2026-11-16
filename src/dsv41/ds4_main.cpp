@@ -353,6 +353,8 @@ struct Req {
     std::vector<int64_t> marks;
     long long shared = -1, tail = -1;
     long long rid = -1;     // rid=<id> (--parallel: every request's, its lines tagged with it)
+    int pri = 0;            // pri=N (this fork, --parallel): an urgent request. While one is answering, the others join only one round
+                            // in STRATA_DS4_PRI_SHARE, prompts are read less often between rounds, and its own prompt is read first
     float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's, dspark_cum_default)
     // the penalties (penalty_last_n / _repeat / _freq / _present, llama.cpp's): over the last pen_n tokens of the state
     // (-1: the whole context, which the engine caps at its window; 0: none)
@@ -487,6 +489,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
         else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
         else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
+        else if (k == "pri") r.pri = std::atoi(v.c_str());
         else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
         else if (k == "pin") r.pin = std::atoll(v.c_str());
         else if (k == "shared") r.shared = std::atoll(v.c_str());
@@ -1539,6 +1542,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                                              (size_t) env_count("STRATA_DS4_READ_PIECE", 1)
                                                        : (size_t) m.feed_unit();
         const int read_rounds = env_count("STRATA_DS4_READ_ROUNDS", 1);
+        // urgent requests (pri=N): the rounds between two pieces of a prompt while one of them is answering (more of them:
+        // its answer keeps its pace while others' prompts are read), and the share of rounds the other answers join then
+        const int read_rounds_pri = env_count("STRATA_DS4_READ_ROUNDS_PRI", read_rounds * 4);
+        const int pri_share = env_count("STRATA_DS4_PRI_SHARE", 3);
+        long long round_no = 0;
         // the reader's lines posted and taken: one waiting, a prompt read alone yields to it
         std::atomic<long long> lines_posted{0};
         long long lines_taken = 0;
@@ -1591,13 +1599,21 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         size_t n_answer = 0;
         // (with several running, a round's tokens all at once: every one then needs the model in the same step, so
         //  their rounds go through it together - the drafts of each in one window; Project Maya #611)
+        // an urgent answer running: the others rest this round unless it is their turn (one round in pri_share), so the
+        // model's rows go to the urgent ones; a resting answer keeps its next token and takes it up at its next round
+        ++round_no;
+        bool pri_on = false;
+        for (auto& ap : acts) pri_on = pri_on || (!ap->reading && ap->r.pri > 0);
+        const bool others_rest = pri_on && pri_share > 1 && round_no % pri_share != 0;
+        const auto rests = [&](const Act& a) { return others_rest && a.r.pri <= 0; };
         size_t several_n = 0;
-        for (auto& ap : acts) several_n += ap->reading ? 0 : 1;
+        for (auto& ap : acts) several_n += ap->reading || rests(*ap) ? 0 : 1;
         const bool several = several_n > 1;
         for (auto& ap : acts) {
             Act& a = *ap;
             if (a.reading) continue;
             ++n_answer;
+            if (rests(a)) continue;
             for (;;) {
                 if (in.stopped(a.r.rid)) {
                     a.finish = "cancel";
@@ -1794,6 +1810,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // a prompt whole in one piece joins the line ahead of the longer reads, behind the other one-piece prompts
         const auto one_piece = [&](const Act* a) { return a->r.ids.size() - a->P.done <= read_piece; };
         const auto join_read = [&](Act* a) {
+            if (a->r.pri > 0) {   // an urgent prompt goes first
+                read_line.push_front(a);
+                return;
+            }
             if (!one_piece(a)) {
                 read_line.push_back(a);
                 return;
@@ -1891,7 +1911,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             read_line.pop_front();
             const bool alone = read_line.empty() && !answering;
             if (!a->done) read_turn(*a, alone ? a->r.ids.size() : read_piece, alone);
-            if (a->reading && !a->done) read_line.push_back(a);
+            if (a->reading && !a->done) {   // (an urgent prompt stays first in the line)
+                if (a->r.pri > 0) read_line.push_front(a);
+                else read_line.push_back(a);
+            }
         };
         std::function<void()> settle;
         // the next turn: a piece once the rounds since the last one are due while a prompt is being read, else a round
@@ -1903,7 +1926,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 turn_queued = false;
                 const bool answering = std::any_of(acts.begin(), acts.end(),
                                                    [](const std::unique_ptr<Act>& a) { return !a->reading; });
-                if (!read_line.empty() && (!answering || rounds >= read_rounds)) {
+                // an urgent prompt is read without waiting for rounds; while an urgent answer runs, other prompts wait longer
+                const bool pri_reading = !read_line.empty() && read_line.front()->r.pri > 0;
+                const bool pri_answering = std::any_of(acts.begin(), acts.end(),
+                                                       [](const std::unique_ptr<Act>& a) { return !a->reading && a->r.pri > 0; });
+                const int due = pri_reading ? 1 : pri_answering ? read_rounds_pri : read_rounds;
+                if (!read_line.empty() && (!answering || rounds >= due)) {
                     read_turn_next(answering);
                     rounds = 0;
                 } else if (answering) {

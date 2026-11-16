@@ -1682,6 +1682,11 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
+        # an urgent request (this fork): the front end in front of this server marks the requests that go first; the
+        # engine then gives them most of its rounds while they answer (pri=N, --parallel only)
+        pri = sampling.get("strata_priority")
+        if isinstance(pri, int) and not isinstance(pri, bool) and pri > 0:
+            keys += f" pri={min(pri, 9)}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
