@@ -1,0 +1,1063 @@
+diff --git a/vllm/envs.py b/vllm/envs.py
+index b6f86a0f3..dd6a7ac31 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -512,6 +512,9 @@ if TYPE_CHECKING:
+     VLLM_V41_PREFILL_TIMING: str = "0"
+     VLLM_V41_ROUTED_PREFILL_MAX: str = "1536"
+     VLLM_V41_ROUTER_FUSED: str = "1"
++    VLLM_V41_VISION: str = "0"
++    VLLM_V41_VISION_MMPROJ: str | None = None
++    VLLM_V41_VISION_BIAS_VL: str | None = None
+     VLLM_V41_ROUTE_TRACE: str | None = None
+     VLLM_V41_ROWS_TILE: str = "4,8"
+     VLLM_V41_SESSION_PREFIX: str = "0"
+@@ -7786,6 +7789,39 @@ environment_variables: dict[str, Callable[[], Any]] = {
+         acceleration_paths=(),
+         user_visible=False,
+     ),
++    "VLLM_V41_VISION": env_var(
++        lambda: os.getenv("VLLM_V41_VISION", "0"),
++        description=(
++            "DS-V4.1: image inputs (ViT + aligner on the first stage, "
++            "VL routing bias, no Engram n-grams over image spans)."
++        ),
++        category="experimental",
++        declared_default="'0'",
++        effective_default="'0'",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
++    "VLLM_V41_VISION_MMPROJ": env_var(
++        lambda: os.getenv("VLLM_V41_VISION_MMPROJ"),
++        description=("DS-V4.1 GGUF: the vision projector (llama.cpp mmproj, deepseek41v)."),
++        category="experimental",
++        declared_default="None",
++        effective_default="None",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
++    "VLLM_V41_VISION_BIAS_VL": env_var(
++        lambda: os.getenv("VLLM_V41_VISION_BIAS_VL"),
++        description=("DS-V4.1 GGUF: the image routing bias, F32 [layers, experts] (exp_probs_b_vl.f32)."),
++        category="experimental",
++        declared_default="None",
++        effective_default="None",
++        automatic_conditions=(),
++        acceleration_paths=(),
++        user_visible=False,
++    ),
+     "VLLM_V41_ROUTER_FUSED": env_var(
+         lambda: os.getenv("VLLM_V41_ROUTER_FUSED", "1"),
+         description=("DS-V4.1 SM70 runtime switch (developer)."),
+@@ -20375,6 +20411,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
+         "VLLM_V41_PREFILL_TIMING",
+         "VLLM_V41_ROUTED_PREFILL_MAX",
+         "VLLM_V41_ROUTER_FUSED",
++        "VLLM_V41_VISION",
++        "VLLM_V41_VISION_MMPROJ",
++        "VLLM_V41_VISION_BIAS_VL",
+         "VLLM_V41_ROUTE_TRACE",
+         "VLLM_V41_ROWS_TILE",
+         "VLLM_V41_SESSION_PREFIX",
+diff --git a/vllm/models/deepseek_v41/dspark.py b/vllm/models/deepseek_v41/dspark.py
+index 78174b562..06fb9df29 100644
+--- a/vllm/models/deepseek_v41/dspark.py
++++ b/vllm/models/deepseek_v41/dspark.py
+@@ -101,6 +101,12 @@ class V41DraftAttention(V41Attention):
+ 
+ 
+ class V41DraftMoE(V41MoE):
++    def __init__(self, vllm_config, prefix):
++        super().__init__(vllm_config, prefix)
++        # The drafter never routes image rows (the reference MTP takes no
++        # image mask): its checkpoint VL bias is not loaded.
++        self.gate.bias_vl = None
++
+     def forward(self, x):
+         routed, shared = self.experts.forward_partials(
+             hidden_states=x, router_logits=self.gate(x)
+diff --git a/vllm/models/deepseek_v41/model.py b/vllm/models/deepseek_v41/model.py
+index ad20b4c1e..74abd8957 100644
+--- a/vllm/models/deepseek_v41/model.py
++++ b/vllm/models/deepseek_v41/model.py
+@@ -50,6 +50,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+ from vllm.model_executor.models.interfaces import (
+     EagleModelMixin,
+     SupportsEagle3,
++    SupportsMultiModal,
+     SupportsPP,
+ )
+ from vllm.model_executor.models.utils import (
+@@ -58,6 +59,7 @@ from vllm.model_executor.models.utils import (
+     maybe_prefix,
+ )
+ from vllm.models.deepseek_v41 import dense_tm
++from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.models.deepseek_v41.activations import swiglu
+ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+@@ -77,6 +79,21 @@ from .contract import pp_split_problem, validate_runtime_geometry
+ from .norm import short_rms_norm
+ from .pp_commit import StageCommit
+ from .quant_rope import apply_rope, attention_qdq, rope_table
++from .vision import (
++    DEFAULT_IMAGE_TOKEN_ID,
++    IMAGE_PLACEHOLDER,
++    VISION,
++    DeepseekV41DummyInputsBuilder,
++    DeepseekV41MultiModalProcessor,
++    DeepseekV41ProcessingInfo,
++    V41VisionTower,
++    load_bias_vl,
++)
++
++# VLLM_V41_VISION: image-span rows of the target forward being run (None when
++# the batch has no image token). Every MoE gate of the stage routes those rows
++# with its VL bias; set and cleared by DeepseekV41Model.forward only.
++_VL_MASK: list[torch.Tensor | None] = [None]
+ 
+ _HC_FUSED = envs.VLLM_V41_HC_FUSED == "1"
+ _ROUTER_FUSED = envs.VLLM_V41_ROUTER_FUSED == "1"
+@@ -148,6 +165,14 @@ class V41Gate(nn.Module):
+             requires_grad=False,
+         )
+         self.temperature = getattr(config, "gate_temp", 1.0)
++        # Routing bias of image-span tokens (selects experts, never scales).
++        self.bias_vl: torch.Tensor | None = None
++        if VISION:
++            self.register_buffer(
++                "bias_vl",
++                torch.zeros(config.n_routed_experts, dtype=torch.float32),
++                persistent=False,
++            )
+ 
+     def forward(self, x):
+         logits = fp32_projection(x, self.weight)
+@@ -180,8 +205,26 @@ class V41MoE(nn.Module):
+             self, "gate_proj", "down_proj", "up_proj", c.n_routed_experts
+         )
+ 
++    def _route_vl(self, gating_output, image, topk):
++        """The reference gate with a per-row bias: VL rows add bias_vl."""
++        bias_vl = self.gate.bias_vl
++        assert bias_vl is not None
++        scores = F.softplus(gating_output.float()).sqrt()
++        bias = torch.where(image[:, None], bias_vl, self.gate.bias)
++        indices = (scores + bias).topk(topk, dim=-1).indices
++        probabilities = scores.gather(1, indices)
++        probabilities = probabilities / (probabilities.sum(-1, keepdim=True) + 1e-20)
++        return (probabilities * self.scale).contiguous(), indices
++
+     def _route(self, hidden_states, gating_output, topk, renormalize):
+         del hidden_states, renormalize
++        image = _VL_MASK[0]
++        if (
++            image is not None
++            and self.gate.bias_vl is not None
++            and image.shape[0] == gating_output.shape[0]
++        ):
++            return self._route_vl(gating_output, image, topk)
+         if _ROUTER_FUSED and gating_output.is_cuda:
+             routed = route_topk(gating_output.float(), self.gate.bias, topk, self.scale)
+             if _SKIP_SUBST:
+@@ -848,6 +891,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+         )
+         self.hash_state: V41EngramHashState | None = None
+         self.engram_io: SharedEngramIO | None = None
++        # VLLM_V41_VISION: every image-span position carries this id; the
++        # runner tells (v41_set_vision) whether this step holds any of them.
++        self.image_token_id = int(
++            getattr(
++                vllm_config.model_config.hf_config,
++                "image_token_id",
++                DEFAULT_IMAGE_TOKEN_ID,
++            )
++        )
++        self.vl_step = False
+         # PP: the first stage owns the committed per-step state (Engram hash,
+         # ratio-2 compressors). When it is not also the last stage it never
+         # samples, so it commits its own forwards (pp_commit.py).
+@@ -884,11 +937,36 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+             max_tokens=maximum,
+             max_context=max(16384, self.vllm_config.model_config.max_model_len),
+         )
++        if VISION:
++            # Image tokens take no part in an n-gram (the reference's DEAD
++            # token): their compressed id -1 blocks every n-gram through them,
++            # in the hashes, the per-request histories and prefix restores.
++            self.hash_state.token_map[self.image_token_id] = -1
+         path = self.vllm_config.load_config.model_loader_extra_config["engram_path"]
+         self.engram_io = SharedEngramIO(path, max_tokens=maximum)
+ 
+     def forward(
+         self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
++    ):
++        image = None
++        if (
++            VISION
++            and self.vl_step
++            and input_ids is not None
++            and not torch.cuda.is_current_stream_capturing()
++        ):
++            # Prefill steps only (no image token is ever in a graph batch).
++            image = input_ids[: positions.numel()] == self.image_token_id
++        _VL_MASK[0] = image
++        try:
++            return self._forward(
++                input_ids, positions, inputs_embeds, intermediate_tensors, image
++            )
++        finally:
++            _VL_MASK[0] = None
++
++    def _forward(
++        self, input_ids, positions, inputs_embeds, intermediate_tensors, image
+     ):
+         tokens = positions.numel()
+         if (
+@@ -937,14 +1015,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+             # of its last FFN; this stage starts with the reference mixes.
+             hidden, pre = intermediate_tensors["hidden"], intermediate_tensors["pre"]
+         auxiliary: Any = []
++        # Image-span rows get no Engram contribution (the gate is shut).
++        engram_valid = valid if image is None or valid is None else valid & ~image
+         if _HC_FUSED:
+             result = self._forward_fused(
+-                hidden, positions, pre, metadata, valid, auxiliary
++                hidden, positions, pre, metadata, engram_valid, auxiliary
+             )
+             _join_expert_writebacks()
+         else:
+             result = self._forward_reference(
+-                hidden, positions, pre, metadata, valid, auxiliary
++                hidden, positions, pre, metadata, engram_valid, auxiliary
+             )
+             _join_expert_writebacks()
+         if isinstance(result, IntermediateTensors):
+@@ -1161,7 +1241,23 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+         return (max_tokens - before).clamp_min(0)
+ 
+ 
+-class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
++@MULTIMODAL_REGISTRY.register_processor(
++    DeepseekV41MultiModalProcessor,
++    info=DeepseekV41ProcessingInfo,
++    dummy_inputs=DeepseekV41DummyInputsBuilder,
++)
++class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP, SupportsMultiModal):
++    # Image inputs only with VLLM_V41_VISION=1 (the processing info offers no
++    # modality otherwise, so the runner stays on token ids and full graphs).
++    # Every stage reads the token ids: image rows are told apart by their id.
++    requires_raw_input_tokens = True
++
++    @classmethod
++    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
++        if modality.startswith("image"):
++            return IMAGE_PLACEHOLDER
++        raise ValueError("V4.1 accepts image inputs only")
++
+     def __init__(self, *, vllm_config, prefix=""):
+         super().__init__()
+         c = self.config = vllm_config.model_config.hf_text_config
+@@ -1231,12 +1327,91 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
+         else:
+             self.lm_head = PPMissingLayer()
+         self.logits_processor = LogitsProcessor(c.vocab_size)
++        # Read by the spec-decode proposer of a multimodal target.
++        c.image_token_index = self.model.image_token_id
++        # GGUF route: the tower comes from the llama.cpp vision projector
++        # (VLLM_V41_VISION_MMPROJ) and the image routing bias from its F32
++        # sidecar (VLLM_V41_VISION_BIAS_VL); neither is in the backbone GGUF.
++        # The tower runs where the embeddings are made (first stage),
++        # replicated on its TP ranks; rank 0's spans are broadcast.
++        self.vision_tower: V41VisionTower | None = None
++        if VISION:
++            load_bias_vl(self.model.layers, V41Gate, c)
++            if get_pp_group().is_first_rank:
++                vision_config = getattr(
++                    vllm_config.model_config.hf_config, "vision_config", None
++                )
++                if not vision_config:
++                    raise ValueError("VLLM_V41_VISION: the config has no vision tower")
++                self.vision_tower = V41VisionTower(
++                    vision_config, c.hidden_size, vllm_config.model_config.dtype
++                )
++                self.vision_tower.load_mmproj()
++
++    def embed_input_ids(
++        self, input_ids, multimodal_embeddings=None, *, is_multimodal=None
++    ):
++        embeddings = self.model.embed_tokens(input_ids)
++        if not multimodal_embeddings or is_multimodal is None:
++            return embeddings
++        from vllm.model_executor.models.utils import _merge_multimodal_embeddings
++
++        return _merge_multimodal_embeddings(
++            embeddings, multimodal_embeddings, is_multimodal
++        )
+ 
+-    def embed_input_ids(self, input_ids):
+-        return self.model.embed_tokens(input_ids)
++    def embed_multimodal(self, **kwargs: object):
++        patches = kwargs.get("pixel_patches")
++        if patches is None:
++            return []
++        sizes = kwargs["patches_per_image"]
++        grids = kwargs["vit_grid"]
++        if isinstance(patches, list):
++            patches = torch.cat(list(patches))
++        sizes = torch.as_tensor(sizes).reshape(-1).tolist()
++        grids = torch.as_tensor(grids).reshape(-1, 2).tolist()
++        tower = self.vision_tower
++        if tower is None:
++            # Only the profile run gets here (embeddings are consumed on the
++            # first stage): spans of the right shape, never used.
++            ratio = 3
++            return [
++                torch.zeros(
++                    -(-int(h) // ratio) * (-(-int(w) // ratio) + 1) + 2,
++                    self.config.hidden_size,
++                    dtype=self.model.embed_tokens.weight.dtype,
++                    device=self.model.embed_tokens.weight.device,
++                )
++                for h, w in grids
++            ]
++        assert isinstance(patches, torch.Tensor)
++        device = tower.image_start.device
++        spans = []
++        for chunk, (n_h, n_w) in zip(patches.split(sizes), grids):
++            span = tower.span(chunk.to(device), int(n_h), int(n_w))
++            if get_tensor_model_parallel_world_size() > 1:
++                from vllm.distributed import get_tp_group
++
++                # Every TP rank must route identical rows.
++                span = get_tp_group().broadcast(span.contiguous(), src=0)
++            spans.append(span)
++        return spans
++
++    def v41_set_vision(self, input_ids_np):
++        """Runner hook (host ids of the step): does it hold image tokens?"""
++        if VISION:
++            self.model.vl_step = bool((input_ids_np == self.model.image_token_id).any())
++
++    def get_language_model(self):
++        return self
+ 
+     def forward(
+-        self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None
++        self,
++        input_ids,
++        positions,
++        intermediate_tensors=None,
++        inputs_embeds=None,
++        **kwargs,
+     ):
+         if intermediate_tensors is None:
+             return self.model(input_ids, positions, inputs_embeds)
+diff --git a/vllm/renderers/deepseek_v41.py b/vllm/renderers/deepseek_v41.py
+index c93c7a381..0a62962d0 100644
+--- a/vllm/renderers/deepseek_v41.py
++++ b/vllm/renderers/deepseek_v41.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Reuse chat transport while dispatching to the independent V4.1 encoding."""
+ 
+-from vllm.tokenizers.deepseek_v41 import _text_only
++from vllm.tokenizers.deepseek_v41 import _text_only, _vision
+ 
+ from .deepseek_v4 import DeepseekV4Renderer
+ 
+@@ -10,9 +10,10 @@ from .deepseek_v4 import DeepseekV4Renderer
+ class DeepseekV41Renderer(DeepseekV4Renderer):
+     @staticmethod
+     def _validate_messages(messages):
++        images = _vision()
+         for message in messages:
+-            _text_only(message.get("content"))
+-            _text_only(message.get("content_blocks"))
++            _text_only(message.get("content"), images)
++            _text_only(message.get("content_blocks"), images)
+ 
+     def render_messages(self, messages, params):
+         self._validate_messages(messages)
+diff --git a/vllm/tokenizers/deepseek_v41.py b/vllm/tokenizers/deepseek_v41.py
+index 6f62f8fea..d87048433 100644
+--- a/vllm/tokenizers/deepseek_v41.py
++++ b/vllm/tokenizers/deepseek_v41.py
+@@ -11,17 +11,51 @@ from vllm.third_party.deepseek_v41.encoding import encode_messages
+ from .hf import HfTokenizer, get_cached_tokenizer
+ from .protocol import TokenizerLike
+ 
++_IMAGE = "<｜deepseek_image｜>"
+ 
+-def _text_only(value):
++
++def _vision() -> bool:
++    import vllm.envs as envs
++
++    return envs.VLLM_V41_VISION == "1"
++
++
++def _text_only(value, images=False):
++    """Text and tool results; image blocks too when `images` (VLLM_V41_VISION).
++    Placeholder tokens typed into text are always refused."""
+     if isinstance(value, list):
+         for block in value:
+-            if block.get("type") not in ("text", "tool_result"):
+-                raise ValueError("V4.1 first profile admits text and tool results only")
+-            _text_only(block.get("content", block.get("text")))
+-    elif isinstance(value, str) and (
+-        "<｜deepseek_image｜>" in value or "<image>" in value
+-    ):
+-        raise ValueError("V4.1 first profile does not admit image inputs")
++            kind = block.get("type")
++            if images and kind in ("image", "image_url"):
++                continue
++            if kind not in ("text", "tool_result"):
++                raise ValueError(
++                    "V4.1 admits text, tool results"
++                    + (" and images" if images else "")
++                    + " only"
++                )
++            _text_only(block.get("content", block.get("text")), images)
++    elif isinstance(value, str) and (_IMAGE in value or "<image>" in value):
++        raise ValueError("V4.1 does not admit image placeholders in text")
++
++
++def _image_blocks(text):
++    """vLLM's interleaved string (parts joined by newlines, one placeholder
++    per image) -> the content blocks the V4.1 encoding expects."""
++    parts = text.split(_IMAGE)
++    blocks = []
++    for i, part in enumerate(parts):
++        if i > 0 and part.startswith("\n"):
++            part = part[1:]
++        if i < len(parts) - 1 and part.endswith("\n"):
++            part = part[:-1]
++        if part:
++            blocks.append({"type": "text", "text": part})
++        if i < len(parts) - 1:
++            # The pixels travel as multi-modal data; the encoding only needs
++            # the block (its source is not read).
++            blocks.append({"type": "image", "url": "vllm-multimodal"})
++    return blocks
+ 
+ 
+ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+@@ -32,7 +66,12 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+         def apply_chat_template(self, messages, tools=None, **kwargs):
+             conversation = copy.deepcopy(kwargs.get("conversation", messages))
+             for message in conversation:
+-                _text_only(message.get("content"))
++                content = message.get("content")
++                if _vision() and isinstance(content, str) and _IMAGE in content:
++                    # Placeholders inserted by vLLM for the request's images.
++                    message["content"] = _image_blocks(content)
++                    continue
++                _text_only(content)
+                 _text_only(message.get("content_blocks"))
+             if tools:
+                 conversation.insert(0, {"role": "system", "tools": tools})
+@@ -42,16 +81,23 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
+             effort = kwargs.get("reasoning_effort")
+             if effort == "none":
+                 thinking, effort = False, None
++            elif effort == "minimal":
++                # OpenAI clients send "minimal"; V4.1's lightest named level.
++                effort = "low"
+             elif effort == "medium":
+                 effort = 75
+             elif effort == "xhigh":
+                 effort = 100
+-            prompt = encode_messages(
+-                conversation,
+-                thinking_mode="thinking" if thinking else "chat",
+-                drop_thinking=kwargs.get("drop_thinking", True),
+-                reasoning_effort=effort,
+-            )
++            try:
++                prompt = encode_messages(
++                    conversation,
++                    thinking_mode="thinking" if thinking else "chat",
++                    drop_thinking=kwargs.get("drop_thinking", True),
++                    reasoning_effort=effort,
++                )
++            except AssertionError as e:
++                # The encoding validates with asserts: a bad request, not a 500.
++                raise ValueError(str(e)) from e
+             if not kwargs.get("tokenize", True):
+                 return prompt
+             options = {
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 2c88e4d0c..03b033325 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -8536,6 +8536,12 @@ class GPUModelRunner(
+                 scheduler_output,
+                 num_scheduled_tokens_np,
+             )
++            # VLLM_V41_VISION: whether this step holds image-span tokens.
++            set_vision = getattr(self.get_model(), "v41_set_vision", None)
++            if set_vision is not None:
++                set_vision(
++                    self.input_ids.np[: scheduler_output.total_num_scheduled_tokens]
++                )
+             if trace_log:
+                 trace_prepare_inputs_ms = (
+                     time.perf_counter() - trace_prepare_inputs_t0
+diff --git a/vllm/models/deepseek_v41/vision.py b/vllm/models/deepseek_v41/vision.py
+new file mode 100644
+index 000000000..762447d86
+--- /dev/null
++++ b/vllm/models/deepseek_v41/vision.py
+@@ -0,0 +1,548 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DeepSeek V4.1 vision input (VLLM_V41_VISION=1).
++
++GGUF route: the tower's weights come from llama.cpp's vision projector
++(``VLLM_V41_VISION_MMPROJ``, projector type deepseek41v) and the MoE image
++routing bias from its F32 sidecar (``VLLM_V41_VISION_BIAS_VL``, the
++``exp_probs_b_vl.f32`` of the GGUF repository: [layers, experts]).
++
++A port of the checkpoint's reference ``inference/vision.py`` and
++``inference/image_processor.py``. An image becomes a ``n_vit_h x n_vit_w``
++patch grid for the ViT and a ``n_llm_h x n_llm_w`` token grid after the 3x3
++aligner downsample, which the language model sees as
++
++    [IMAGE_START] + ([IMAGE] * n_llm_w + [IMAGE_NEW_LINE]) * n_llm_h + [IMAGE_END]
++
++Every position of that span carries ``image_token_id`` in the prompt; the
++embedding of each position (learned delimiters, aligner rows) comes from the
++vision tower. The language model tells image positions apart by that token id:
++they take the VL routing bias in every MoE gate and no Engram n-gram.
++"""
++
++import math
++from collections.abc import Mapping, Sequence
++from functools import lru_cache
++from typing import Any
++
++import numpy as np
++import torch
++from PIL import Image, ImageOps
++from torch import nn
++from torch.nn import functional as F
++from transformers import BatchFeature
++
++import vllm.envs as envs
++from vllm.config.multimodal import BaseDummyOptions, ImageDummyOptions
++from vllm.inputs import MultiModalDataDict
++from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
++from vllm.multimodal.parse import ImageProcessorItems, MultiModalDataItems
++from vllm.multimodal.processing import (
++    BaseDummyInputsBuilder,
++    BaseMultiModalProcessor,
++    BaseProcessingInfo,
++    PromptReplacement,
++    PromptUpdate,
++)
++
++VISION = envs.VLLM_V41_VISION == "1"
++IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
++DEFAULT_IMAGE_TOKEN_ID = 129264
++
++
++# ---------------------------------------------------------------- geometry
++
++
++class V41VisionGeometry:
++    """The checkpoint's vision_config fields used by the preprocessing."""
++
++    def __init__(self, vision_config: Mapping[str, Any] | None):
++        v = dict(vision_config or {})
++        self.patch_size = int(v.get("patch_size", 14))
++        self.downsample_ratio = int(v.get("downsample_ratio", 3))
++        self.max_n_token = int(v.get("max_image_tokens", 1024))
++        self.min_pixels = int(v.get("min_pixels", 544 * 544))
++        ratio = v.get("max_wh_ratio")
++        self.max_wh_ratio = None if ratio is None else int(ratio)
++        self.dim = int(v.get("hidden_size", 1024))
++        self.n_heads = int(v.get("num_attention_heads", 16))
++        self.inter_dim = int(v.get("intermediate_size", 2816))
++        self.n_layers = int(v.get("num_hidden_layers", 32))
++        self.rope_theta = float(v.get("rope_theta", 10000.0))
++
++
++def num_image_tokens(n_llm_h: int, n_llm_w: int) -> int:
++    return n_llm_h * (n_llm_w + 1) + 2
++
++
++def _llm_grid(best_height, best_width, patch_size, downsample_ratio):
++    return math.ceil((best_height // patch_size) / downsample_ratio), math.ceil(
++        (best_width // patch_size) / downsample_ratio
++    )
++
++
++def _solve_resize_ratio(height, width, patch_size, downsample_ratio, max_n_token):
++    r = height / width
++    max_w_float = math.sqrt((max_n_token - 2) / r + 0.25) - 0.5
++    max_h_float = max_w_float * r
++    cell = patch_size * downsample_ratio
++    if max_w_float < 1.0:  # very tall: collapse to a single column
++        return (max_n_token - 2) // 2 * cell, cell
++    if max_h_float < 1.0:  # very wide: collapse to a single row
++        return cell, (max_n_token - 3) * cell
++    beta = min(
++        math.floor(max_w_float) * cell / width,
++        math.floor(max_h_float) * cell / height,
++    )
++    return (
++        math.floor(height * beta / patch_size) * patch_size,
++        math.floor(width * beta / patch_size) * patch_size,
++    )
++
++
++def _safe_resize(
++    height, width, best_height, best_width, patch_size, downsample_ratio, max_n_token
++):
++    n_llm_h, n_llm_w = _llm_grid(best_height, best_width, patch_size, downsample_ratio)
++    if num_image_tokens(n_llm_h, n_llm_w) > max_n_token:
++        best_height, best_width = _solve_resize_ratio(
++            height, width, patch_size, downsample_ratio, max_n_token
++        )
++        n_llm_h, n_llm_w = _llm_grid(
++            best_height, best_width, patch_size, downsample_ratio
++        )
++        assert num_image_tokens(n_llm_h, n_llm_w) <= max_n_token
++    return n_llm_h, n_llm_w, best_height, best_width
++
++
++def plan_image_grid(width: int, height: int, g: V41VisionGeometry):
++    """(n_llm_h, n_llm_w, best_height, best_width) of an image of this size."""
++    p = g.patch_size
++    if g.max_wh_ratio is not None and width > height * g.max_wh_ratio:
++        width = height * g.max_wh_ratio
++    if 0 < width * height < g.min_pixels:
++        ratio = (g.min_pixels / (width * height)) ** 0.5
++        width = int(width * ratio)
++        height = int(height * ratio)
++    best_width = math.ceil(width / p) * p
++    best_height = math.ceil(height / p) * p
++    return _safe_resize(
++        height,
++        width,
++        best_height,
++        best_width,
++        p,
++        g.downsample_ratio,
++        g.max_n_token,
++    )
++
++
++def image_patches(image: Image.Image, g: V41VisionGeometry):
++    """(patches [n_vit_h * n_vit_w, 3 * p * p] FP16, n_vit_h, n_vit_w).
++
++    The reference rounds the normalized pixels to BF16; FP16 holds every BF16
++    value in [-1, 1] exactly, so the ViT sees the same inputs."""
++    p = g.patch_size
++    image = image.convert("RGB")
++    _, _, best_height, best_width = plan_image_grid(image.width, image.height, g)
++    n_vit_h, n_vit_w = best_height // p, best_width // p
++    if g.max_wh_ratio is not None and image.width >= g.max_wh_ratio * image.height:
++        image = image.resize((best_width, best_height))
++    else:
++        image = ImageOps.pad(image, (best_width, best_height), color=(127, 127, 127))
++    x = torch.from_numpy(np.asarray(image, dtype=np.float32)).permute(2, 0, 1) / 255
++    x = ((x - 0.5) / 0.5).to(torch.bfloat16)
++    patches = (
++        x.reshape(3, n_vit_h, p, n_vit_w, p)
++        .permute(1, 3, 0, 2, 4)
++        .reshape(n_vit_h * n_vit_w, 3 * p * p)
++    )
++    return patches.to(torch.float16), n_vit_h, n_vit_w
++
++
++# ---------------------------------------------------------------- tower
++
++
++@lru_cache(8)
++def _vision_cos_sin(n_h: int, n_w: int, dim: int, theta: float, device: str):
++    inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
++    hpos = torch.arange(n_h).unsqueeze(1).expand(n_h, n_w)
++    wpos = torch.arange(n_w).unsqueeze(0).expand(n_h, n_w)
++    freqs = torch.stack([hpos, wpos], dim=-1).reshape(-1, 2, 1).float() * inv_freq
++    freqs = freqs.flatten(1)
++    return (
++        freqs.cos().unsqueeze(1).to(device),
++        freqs.sin().unsqueeze(1).to(device),
++    )
++
++
++def _rotary(x, cos, sin):
++    dtype = x.dtype
++    x1, x2 = x.float().chunk(2, dim=-1)
++    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1).to(dtype)
++
++
++class _RMSNorm(nn.Module):
++    def __init__(self, dim, eps=1e-6):
++        super().__init__()
++        self.eps = eps
++        self.weight = nn.Parameter(
++            torch.ones(dim, dtype=torch.float32), requires_grad=False
++        )
++
++    def forward(self, x):
++        x = x.float()
++        x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
++        return self.weight * x
++
++
++def _linear(i, o, bias):
++    layer = nn.Linear(i, o, bias=bias)
++    layer.weight.requires_grad_(False)
++    if bias:
++        layer.bias.requires_grad_(False)
++    return layer
++
++
++class _PatchEmbed(nn.Module):
++    def __init__(self, g):
++        super().__init__()
++        self.proj = _linear(3 * g.patch_size**2, g.dim, True)
++
++
++class _Attention(nn.Module):
++    def __init__(self, g):
++        super().__init__()
++        self.n_heads = g.n_heads
++        self.head_dim = g.dim // g.n_heads
++        self.wqkv = _linear(g.dim, 3 * g.dim, True)
++        self.wo = _linear(g.dim, g.dim, True)
++
++    def forward(self, x, cos, sin):
++        n = x.size(0)
++        q, k, v = (
++            t.reshape(n, self.n_heads, self.head_dim)
++            for t in self.wqkv(x).chunk(3, dim=-1)
++        )
++        q, k = _rotary(q, cos, sin), _rotary(k, cos, sin)
++        o = F.scaled_dot_product_attention(
++            q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None]
++        )[0]
++        return self.wo(o.transpose(0, 1).reshape(n, -1))
++
++
++class _MLP(nn.Module):
++    def __init__(self, g):
++        super().__init__()
++        self.w1 = _linear(g.dim, 2 * g.inter_dim, False)
++        self.w2 = _linear(g.inter_dim, g.dim, False)
++
++    def forward(self, x):
++        gate, up = self.w1(x).float().chunk(2, dim=-1)
++        return self.w2((F.silu(gate) * up).to(x.dtype))
++
++
++class _Block(nn.Module):
++    def __init__(self, g):
++        super().__init__()
++        self.norm1 = _RMSNorm(g.dim)
++        self.attn = _Attention(g)
++        self.norm2 = _RMSNorm(g.dim)
++        self.mlp = _MLP(g)
++
++
++class _ViT(nn.Module):
++    """Full bidirectional attention over one image with 2D RoPE."""
++
++    def __init__(self, g):
++        super().__init__()
++        self.g = g
++        self.patch_embed = _PatchEmbed(g)
++        self.blocks = nn.ModuleList([_Block(g) for _ in range(g.n_layers)])
++        self.norm = _RMSNorm(g.dim)
++
++    def forward(self, patches, n_h, n_w):
++        # The residual stream stays FP32 (the reference keeps BF16 range);
++        # each sublayer takes FP16 inputs (FP32 tensor-core accumulation).
++        dtype = self.patch_embed.proj.weight.dtype
++        x = self.patch_embed.proj(patches.to(dtype)).float()
++        cos, sin = _vision_cos_sin(
++            n_h,
++            n_w,
++            self.g.dim // self.g.n_heads // 2,
++            self.g.rope_theta,
++            str(x.device),
++        )
++        for block in self.blocks:
++            x = x + block.attn(block.norm1(x).to(dtype), cos, sin).float()
++            x = x + block.mlp(block.norm2(x).to(dtype)).float()
++        return self.norm(x)
++
++
++class _Aligner(nn.Module):
++    def __init__(self, g, out_dim):
++        super().__init__()
++        self.r = g.downsample_ratio
++        self.w1 = _linear(g.dim * self.r**2, out_dim, True)
++        self.w2 = _linear(out_dim, out_dim, True)
++
++    def forward(self, x, n_h, n_w):
++        r, dtype = self.r, self.w1.weight.dtype
++        x = x.view(n_h, n_w, -1).permute(2, 0, 1)
++        x = F.pad(x, (0, -n_w % r, 0, -n_h % r))
++        x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
++        return self.w2(F.gelu(self.w1(x.to(dtype)).float()).to(dtype))
++
++
++def mmproj_state_dict(path: str) -> dict[str, torch.Tensor]:
++    """llama.cpp mmproj (deepseek41v) -> the checkpoint's tower names (FP32)."""
++    from gguf import GGUFReader
++
++    reader = GGUFReader(path)
++    field = reader.fields.get("clip.projector_type")
++    kind = field.contents() if field is not None else None
++    if kind not in ("deepseek41v", "deepseek4v"):
++        raise ValueError(f"{path}: not a DeepSeek V4.1 vision projector ({kind})")
++    tensors = {t.name: t for t in reader.tensors}
++
++    def get(name):
++        t = tensors[name]
++        a = np.asarray(t.data)
++        if t.tensor_type.name == "BF16":
++            a = (a.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
++        elif t.tensor_type.name in ("F32", "F16"):
++            a = a.astype(np.float32)
++        else:
++            raise ValueError(f"{path}: {name} is {t.tensor_type.name} (F32/F16/BF16 only)")
++        shape = [int(d) for d in reversed(t.shape.tolist())]
++        return torch.from_numpy(a.reshape(shape).copy())
++
++    sd = {
++        # conv2d [dim, 3, p, p] == the reference Linear over flattened patches
++        "vision.patch_embed.proj.weight": get("v.patch_embd.weight").flatten(1),
++        "vision.patch_embed.proj.bias": get("v.patch_embd.bias"),
++        "vision.norm.weight": get("v.post_ln.weight"),
++        "aligner.w1.weight": get("mm.1.weight"),
++        "aligner.w1.bias": get("mm.1.bias"),
++        "aligner.w2.weight": get("mm.2.weight"),
++        "aligner.w2.bias": get("mm.2.bias"),
++        "image_start": get("v.token_embd.img_start"),
++        "image_end": get("v.token_embd.img_end"),
++        "image_newline": get("v.image_newline"),
++    }
++    n = 0
++    while f"v.blk.{n}.ln1.weight" in tensors:
++        b, o = f"v.blk.{n}.", f"vision.blocks.{n}."
++        sd[o + "norm1.weight"] = get(b + "ln1.weight")
++        sd[o + "norm2.weight"] = get(b + "ln2.weight")
++        sd[o + "attn.wqkv.weight"] = get(b + "attn_qkv.weight")
++        sd[o + "attn.wqkv.bias"] = get(b + "attn_qkv.bias")
++        sd[o + "attn.wo.weight"] = get(b + "attn_out.weight")
++        sd[o + "attn.wo.bias"] = get(b + "attn_out.bias")
++        # llama.cpp splits the fused SwiGLU w1 (gate first, then up)
++        sd[o + "mlp.w1.weight"] = torch.cat(
++            [get(b + "ffn_gate.weight"), get(b + "ffn_up.weight")]
++        )
++        sd[o + "mlp.w2.weight"] = get(b + "ffn_down.weight")
++        n += 1
++    return sd
++
++
++def load_bias_vl(layers, gate_type, config) -> None:
++    """Fill every local MoE gate's bias_vl from VLLM_V41_VISION_BIAS_VL."""
++    path = envs.VLLM_V41_VISION_BIAS_VL
++    if not path:
++        raise ValueError(
++            "VLLM_V41_VISION=1 on the GGUF route needs VLLM_V41_VISION_BIAS_VL "
++            "(exp_probs_b_vl.f32, F32 [layers, experts])"
++        )
++    n_layers, n_experts = config.num_hidden_layers, config.n_routed_experts
++    raw = np.fromfile(path, dtype="<f4")
++    if raw.size != n_layers * n_experts or not np.isfinite(raw).all():
++        raise ValueError(f"{path}: expected {n_layers} x {n_experts} finite F32")
++    table = torch.from_numpy(raw.reshape(n_layers, n_experts).copy())
++    for index, layer in enumerate(layers):
++        gate = getattr(getattr(layer, "ffn", None), "gate", None)
++        if isinstance(gate, gate_type) and gate.bias_vl is not None:
++            gate.bias_vl.copy_(table[index].to(gate.bias_vl.device))
++
++
++class V41VisionTower(nn.Module):
++    """ViT + aligner + learned span delimiters; parameter names follow the
++    checkpoint (``vision.*``, ``aligner.*``, ``image_start`` ...)."""
++
++    def __init__(self, vision_config, hidden_size, dtype=torch.float16):
++        super().__init__()
++        g = self.geometry = V41VisionGeometry(vision_config)
++        self.vision = _ViT(g)
++        self.aligner = _Aligner(g, hidden_size)
++        for name in ("image_start", "image_end", "image_newline"):
++            self.register_parameter(
++                name, nn.Parameter(torch.empty(hidden_size), requires_grad=False)
++            )
++        self.to(dtype)
++        # RMSNorm weights stay FP32 (as the reference).
++        for module in self.modules():
++            if isinstance(module, _RMSNorm):
++                module.weight.data = module.weight.data.float()
++
++    @torch.no_grad()
++    def load_mmproj(self, path: str | None = None) -> None:
++        """Weights from llama.cpp's vision projector (VLLM_V41_VISION_MMPROJ)."""
++        path = path or envs.VLLM_V41_VISION_MMPROJ
++        if not path:
++            raise ValueError(
++                "VLLM_V41_VISION=1 on the GGUF route needs VLLM_V41_VISION_MMPROJ "
++                "(mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf)"
++            )
++        state = mmproj_state_dict(path)
++        own = dict(self.named_parameters())
++        missing, extra = own.keys() - state.keys(), state.keys() - own.keys()
++        if missing or extra:
++            raise ValueError(
++                f"{path}: tower mismatch, missing {sorted(missing)[:4]}, "
++                f"extra {sorted(extra)[:4]}"
++            )
++        for name, value in state.items():
++            parameter = own[name]
++            if tuple(value.shape) != tuple(parameter.shape):
++                raise ValueError(f"{path}: {name} {tuple(value.shape)} != {tuple(parameter.shape)}")
++            converted = value.to(parameter.dtype)
++            if not torch.isfinite(converted).all():
++                raise ValueError(f"{path}: {name} overflows {parameter.dtype}")
++            parameter.data.copy_(converted.to(parameter.device))
++
++    @torch.inference_mode()
++    def span(self, patches, n_vit_h, n_vit_w):
++        """The [num_image_tokens, hidden] embeddings of one image span."""
++        g = self.geometry
++        rows = self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
++        n_llm_h = math.ceil(n_vit_h / g.downsample_ratio)
++        n_llm_w = math.ceil(n_vit_w / g.downsample_ratio)
++        hidden = rows.shape[-1]
++        dtype = self.image_start.dtype
++        body = torch.cat(
++            [
++                rows.to(dtype).view(n_llm_h, n_llm_w, hidden),
++                self.image_newline.view(1, 1, hidden).expand(n_llm_h, 1, hidden),
++            ],
++            dim=1,
++        ).reshape(-1, hidden)
++        return torch.cat([self.image_start[None], body, self.image_end[None]])
++
++
++# ---------------------------------------------------------------- processor
++
++
++def _geometry(info) -> V41VisionGeometry:
++    return V41VisionGeometry(getattr(info.get_hf_config(), "vision_config", None))
++
++
++def _image_token_id(info) -> int:
++    return int(getattr(info.get_hf_config(), "image_token_id", DEFAULT_IMAGE_TOKEN_ID))
++
++
++class DeepseekV41ProcessingInfo(BaseProcessingInfo):
++    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
++        # Empty: text-only (the runner keeps token-id inputs and graphs).
++        return {"image": None} if VISION else {}
++
++    def get_mm_max_tokens_per_item(self, seq_len, mm_counts):
++        return {"image": _geometry(self).max_n_token}
++
++    def get_hf_processor(self, **kwargs: object):
++        raise NotImplementedError("V4.1 vision preprocessing runs in vLLM")
++
++    def get_num_image_tokens(self, width: int, height: int) -> int:
++        n_llm_h, n_llm_w, _, _ = plan_image_grid(width, height, _geometry(self))
++        return num_image_tokens(n_llm_h, n_llm_w)
++
++
++class DeepseekV41DummyInputsBuilder(BaseDummyInputsBuilder[DeepseekV41ProcessingInfo]):
++    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
++        return "\n\n".join([IMAGE_PLACEHOLDER] * mm_counts.get("image", 0))
++
++    def get_dummy_mm_data(
++        self,
++        seq_len: int,
++        mm_counts: Mapping[str, int],
++        mm_options: Mapping[str, BaseDummyOptions],
++    ) -> MultiModalDataDict:
++        # A square image at the token cap (1024 -> a 31 x 31 LLM grid).
++        g = _geometry(self.info)
++        side = 31 * g.patch_size * g.downsample_ratio
++        overrides = mm_options.get("image")
++        assert overrides is None or isinstance(overrides, ImageDummyOptions)
++        return {
++            "image": self._get_dummy_images(
++                width=side,
++                height=side,
++                num_images=mm_counts.get("image", 0),
++                overrides=overrides,
++            )
++        }
++
++
++class DeepseekV41MultiModalProcessor(
++    BaseMultiModalProcessor[DeepseekV41ProcessingInfo]
++):
++    def _call_hf_processor(
++        self,
++        prompt: str,
++        mm_data: Mapping[str, object],
++        mm_kwargs: Mapping[str, object],
++        tok_kwargs: Mapping[str, object],
++    ) -> BatchFeature:
++        tokenizer = self.info.get_tokenizer()
++        ids = tokenizer.encode(prompt, add_special_tokens=False)
++        images = mm_data.get("images") or []
++        if not isinstance(images, list):
++            images = [images]
++        g = _geometry(self.info)
++        patches, sizes, grids = [], [], []
++        for image in images:
++            p, n_h, n_w = image_patches(image, g)
++            patches.append(p)
++            sizes.append(p.shape[0])
++            grids.append((n_h, n_w))
++        data: dict[str, Any] = {"input_ids": [ids]}
++        if images:
++            data["pixel_patches"] = torch.cat(patches)
++            data["patches_per_image"] = torch.tensor(sizes, dtype=torch.int64)
++            data["vit_grid"] = torch.tensor(grids, dtype=torch.int64)
++        return BatchFeature(data, tensor_type="pt")
++
++    def _hf_processor_applies_updates(self, *args, **kwargs) -> bool:
++        return False
++
++    def _get_mm_fields_config(
++        self,
++        hf_inputs: BatchFeature,
++        hf_processor_mm_kwargs: Mapping[str, object],
++    ) -> Mapping[str, MultiModalFieldConfig]:
++        sizes = hf_inputs.get("patches_per_image", torch.empty(0, dtype=torch.int64))
++        return dict(
++            pixel_patches=MultiModalFieldConfig.flat_from_sizes("image", sizes),
++            patches_per_image=MultiModalFieldConfig.batched("image"),
++            vit_grid=MultiModalFieldConfig.batched("image"),
++        )
++
++    def _get_prompt_updates(
++        self,
++        mm_items: MultiModalDataItems,
++        hf_processor_mm_kwargs: Mapping[str, object],
++        out_mm_kwargs: MultiModalKwargsItems,
++    ) -> Sequence[PromptUpdate]:
++        image_token_id = _image_token_id(self.info)
++
++        def replacement(item_idx: int):
++            images = mm_items.get_items("image", ImageProcessorItems)
++            size = images.get_image_size(item_idx)
++            count = self.info.get_num_image_tokens(size.width, size.height)
++            return [image_token_id] * count
++
++        return [
++            PromptReplacement(
++                modality="image", target=[image_token_id], replacement=replacement
++            )
++        ]

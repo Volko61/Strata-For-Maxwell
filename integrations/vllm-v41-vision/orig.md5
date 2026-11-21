@@ -1,0 +1,6 @@
+9d4c24805d4928529ba00b132e037fc4  vllm/envs.py
+2310f87fa3064bdc3120f3cf62a089ba  vllm/models/deepseek_v41/model.py
+e8eb9edd9f0e49de38e6b199e5327464  vllm/models/deepseek_v41/dspark.py
+fb745981729a912de7f41041b2e43634  vllm/renderers/deepseek_v41.py
+315e98a323d241de192c7422e21d58f1  vllm/tokenizers/deepseek_v41.py
+1f4bd0a9ff8758476892add38d058367  vllm/v1/worker/gpu_model_runner.py
