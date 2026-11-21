@@ -1,0 +1,1 @@
+curl -s -m 300 http://127.0.0.1:18000/v1/chat/completions -H "Authorization: Bearer $(cat /workspace/api.key)" -H 'content-type: application/json' --data @/workspace/onecat/vision-patch/imgreq.json | python3 -c "import json,sys;d=json.load(sys.stdin);print(d.get('choices',[{}])[0].get('message',{}).get('content') or d)"
