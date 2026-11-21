@@ -4,7 +4,7 @@
 set -e
 R=https://raw.githubusercontent.com/Volko61/Strata-For-Maxwell/claude/project-thread-scwwe7/integrations/vllm-v41-vision
 P=/workspace/onecat/vision-patch; mkdir -p $P
-for f in patch.tgz apply.sh revert.sh orig.md5 exp_probs_b_vl.f32; do curl -fsSL --retry 5 -o $P/$f $R/$f; done
+for f in vision-gguf.diff apply.sh revert.sh exp_probs_b_vl.f32 imgreq.json imgtest.sh; do curl -fsSL --retry 5 -o $P/$f $R/$f; done
 bash $P/apply.sh
 supervisorctl restart onecat
 echo "vLLM restarting with images on; log: /workspace/logs/onecat-server.log (about 6 min)"

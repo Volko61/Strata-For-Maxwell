@@ -80,7 +80,7 @@ index 78174b562..06fb9df29 100644
          routed, shared = self.experts.forward_partials(
              hidden_states=x, router_logits=self.gate(x)
 diff --git a/vllm/models/deepseek_v41/model.py b/vllm/models/deepseek_v41/model.py
-index ad20b4c1e..74abd8957 100644
+index ad20b4c1e..32b004661 100644
 --- a/vllm/models/deepseek_v41/model.py
 +++ b/vllm/models/deepseek_v41/model.py
 @@ -50,6 +50,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -121,22 +121,23 @@ index ad20b4c1e..74abd8957 100644
  
  _HC_FUSED = envs.VLLM_V41_HC_FUSED == "1"
  _ROUTER_FUSED = envs.VLLM_V41_ROUTER_FUSED == "1"
-@@ -148,6 +165,14 @@ class V41Gate(nn.Module):
+@@ -148,6 +165,15 @@ class V41Gate(nn.Module):
              requires_grad=False,
          )
          self.temperature = getattr(config, "gate_temp", 1.0)
 +        # Routing bias of image-span tokens (selects experts, never scales).
-+        self.bias_vl: torch.Tensor | None = None
 +        if VISION:
 +            self.register_buffer(
 +                "bias_vl",
 +                torch.zeros(config.n_routed_experts, dtype=torch.float32),
 +                persistent=False,
 +            )
++        else:
++            self.bias_vl: torch.Tensor | None = None
  
      def forward(self, x):
          logits = fp32_projection(x, self.weight)
-@@ -180,8 +205,26 @@ class V41MoE(nn.Module):
+@@ -180,8 +206,26 @@ class V41MoE(nn.Module):
              self, "gate_proj", "down_proj", "up_proj", c.n_routed_experts
          )
  
@@ -163,7 +164,7 @@ index ad20b4c1e..74abd8957 100644
          if _ROUTER_FUSED and gating_output.is_cuda:
              routed = route_topk(gating_output.float(), self.gate.bias, topk, self.scale)
              if _SKIP_SUBST:
-@@ -848,6 +891,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+@@ -848,6 +892,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
          )
          self.hash_state: V41EngramHashState | None = None
          self.engram_io: SharedEngramIO | None = None
@@ -180,7 +181,7 @@ index ad20b4c1e..74abd8957 100644
          # PP: the first stage owns the committed per-step state (Engram hash,
          # ratio-2 compressors). When it is not also the last stage it never
          # samples, so it commits its own forwards (pp_commit.py).
-@@ -884,11 +937,36 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+@@ -884,11 +938,36 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
              max_tokens=maximum,
              max_context=max(16384, self.vllm_config.model_config.max_model_len),
          )
@@ -217,7 +218,7 @@ index ad20b4c1e..74abd8957 100644
      ):
          tokens = positions.numel()
          if (
-@@ -937,14 +1015,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+@@ -937,14 +1016,16 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
              # of its last FFN; this stage starts with the reference mixes.
              hidden, pre = intermediate_tensors["hidden"], intermediate_tensors["pre"]
          auxiliary: Any = []
@@ -236,7 +237,7 @@ index ad20b4c1e..74abd8957 100644
              )
              _join_expert_writebacks()
          if isinstance(result, IntermediateTensors):
-@@ -1161,7 +1241,23 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
+@@ -1161,7 +1242,23 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
          return (max_tokens - before).clamp_min(0)
  
  
@@ -261,7 +262,7 @@ index ad20b4c1e..74abd8957 100644
      def __init__(self, *, vllm_config, prefix=""):
          super().__init__()
          c = self.config = vllm_config.model_config.hf_text_config
-@@ -1231,12 +1327,91 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
+@@ -1231,12 +1328,92 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsEagle3, SupportsPP):
          else:
              self.lm_head = PPMissingLayer()
          self.logits_processor = LogitsProcessor(c.vocab_size)
@@ -273,6 +274,7 @@ index ad20b4c1e..74abd8957 100644
 +        # The tower runs where the embeddings are made (first stage),
 +        # replicated on its TP ranks; rank 0's spans are broadcast.
 +        self.vision_tower: V41VisionTower | None = None
++        self.vision_dtype = vllm_config.model_config.dtype
 +        if VISION:
 +            load_bias_vl(self.model.layers, V41Gate, c)
 +            if get_pp_group().is_first_rank:
@@ -319,8 +321,8 @@ index ad20b4c1e..74abd8957 100644
 +                torch.zeros(
 +                    -(-int(h) // ratio) * (-(-int(w) // ratio) + 1) + 2,
 +                    self.config.hidden_size,
-+                    dtype=self.model.embed_tokens.weight.dtype,
-+                    device=self.model.embed_tokens.weight.device,
++                    dtype=self.vision_dtype,
++                    device=torch.device("cuda", torch.cuda.current_device()),
 +                )
 +                for h, w in grids
 +            ]
