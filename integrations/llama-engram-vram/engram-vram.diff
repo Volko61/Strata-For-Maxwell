@@ -1,0 +1,369 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 06eb7c9..2180764 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2253,9 +2253,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+ 
+     load_tensors_hadamard();
+ 
++    post_load_tensors();
++
+     return true;
+ }
+ 
++void llama_model::adopt_weights(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft) {
++    ggml_backend_buffer_ptr buf;
++    if (params.no_alloc) {
++        buf.reset(ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0)); // dummy buffer
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++            t->buffer = buf.get();
++        }
++    } else {
++        buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
++    }
++    if (!buf) {
++        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
++    }
++    ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    std::vector<ggml_backend_buffer_ptr> bufs;
++    bufs.emplace_back(std::move(buf));
++    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(bufs));
++}
++
+ // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
+ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
+     uint32_t hadamard_version = 0;
+diff --git a/src/llama-model.h b/src/llama-model.h
+index eae5c68..af97762 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -1083,6 +1083,13 @@ struct llama_model {
+     // optional, runs after the scale pass
+     virtual void post_arch_tensors(llama_model_loader &) {}
+ 
++    // optional, runs once the tensor data is loaded (also in the memory-fit pass, where nothing is allocated)
++    virtual void post_load_tensors() {}
++
++    // allocate the tensors of ctx in buft and keep both alive with the model
++    // the memory-fit pass gives them a dummy buffer, so that memory_breakdown() still counts them
++    void adopt_weights(ggml_context_ptr ctx, ggml_backend_buffer_type_t buft);
++
+ protected:
+     llama_model_params params;
+ 
+diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
+index e481cbd..a8ba9d2 100644
+--- a/src/models/deepseek41.cpp
++++ b/src/models/deepseek41.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include <algorithm>
+ #include <cinttypes>
++#include <numeric>
++#include <sstream>
+ #include <cmath>
+ #include <cstdlib>
+ #include <stdexcept>
+@@ -227,6 +229,165 @@ std::unique_ptr<llm_graph_context> llama_model_deepseek41::build_arch_graph(cons
+     return std::make_unique<graph>(params);
+ }
+ 
++// LLAMA_DSV41_ENGRAM_DEVICES: move the Engram table from the host (mmap / RAM) into device memory
++// the table can be larger than any single device, so it is cut into one piece per listed device
++// the cuts fall between hash heads: every head then gathers from exactly one piece
++void llama_model_deepseek41::post_load_tensors() {
++    const char * env = getenv("LLAMA_DSV41_ENGRAM_DEVICES");
++    if (!env || !*env || !per_layer_tok_embd || hparams.ple_n_heads == 0) {
++        return;
++    }
++
++    struct target {
++        ggml_backend_dev_t dev;
++        double             share;
++    };
++    std::vector<target> targets;
++    {
++        std::stringstream ss(env);
++        std::string item;
++        while (std::getline(ss, item, ',')) {
++            if (item.empty()) {
++                continue;
++            }
++            double share = 1.0;
++            const size_t colon = item.rfind(':');
++            if (colon != std::string::npos) {
++                share = atof(item.c_str() + colon + 1);
++                item.resize(colon);
++            }
++            ggml_backend_dev_t dev = ggml_backend_dev_by_name(item.c_str());
++            if (!dev || !(share > 0.0)) {
++                throw std::runtime_error(format("LLAMA_DSV41_ENGRAM_DEVICES: unknown device or bad share in '%s'", item.c_str()));
++            }
++            targets.push_back({ dev, share });
++        }
++    }
++    if (targets.empty()) {
++        return;
++    }
++
++    const ggml_tensor * src = per_layer_tok_embd;
++    const size_t row_bytes  = src->nb[1];
++    const size_t n_cols     = hparams.ple_n_heads;
++    const size_t n_all      = (size_t) hparams.ple_n_modules*n_cols;
++    const uint32_t * offs   = hparams.ple_head_offsets.data();
++    const uint32_t * primes = hparams.ple_head_vocab_sizes.data();
++
++    // heads in table order; pieces are runs of this order
++    std::vector<size_t> order(n_all);
++    std::iota(order.begin(), order.end(), 0);
++    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return offs[a] < offs[b]; });
++    uint64_t n_used = 0;
++    for (size_t i = 0; i < n_all; ++i) {
++        const size_t c = order[i];
++        if (i + 1 < n_all && (uint64_t) offs[c] + primes[c] > offs[order[i + 1]]) {
++            throw std::runtime_error("LLAMA_DSV41_ENGRAM_DEVICES: the Engram heads share table rows, so the table cannot be cut");
++        }
++        n_used += primes[c];
++    }
++
++    double share_sum = 0.0;
++    for (const auto & t : targets) {
++        share_sum += t.share;
++    }
++
++    // head i goes to the first piece whose cumulative share covers the middle of the head
++    std::vector<int> piece_of(n_all, -1);
++    struct range {
++        int64_t row0 = -1;
++        int64_t row1 = -1;
++        ggml_backend_dev_t dev = nullptr;
++    };
++    std::vector<range> ranges;
++    {
++        size_t   it      = 0;
++        double   cum     = targets[0].share;
++        uint64_t acc     = 0;
++        int      cur     = -1; // index in ranges of the piece of target it
++        for (size_t i = 0; i < n_all; ++i) {
++            const size_t c   = order[i];
++            const double mid = (double) acc + 0.5*primes[c];
++            while (it + 1 < targets.size() && mid >= (double) n_used*cum/share_sum) {
++                cum += targets[++it].share;
++                cur = -1;
++            }
++            if (cur < 0) {
++                cur = (int) ranges.size();
++                ranges.push_back({ (int64_t) offs[c], 0, targets[it].dev });
++            }
++            ranges[cur].row1 = (int64_t) offs[c] + primes[c];
++            piece_of[c] = cur;
++            acc += primes[c];
++        }
++    }
++
++    engram_pieces.clear();
++    engram_groups.assign(hparams.ple_n_modules, {});
++
++    std::vector<uint8_t> tmp;
++    for (size_t p = 0; p < ranges.size(); ++p) {
++        const auto & r = ranges[p];
++        const int64_t n_rows = r.row1 - r.row0;
++        GGML_ASSERT(r.row0 >= 0 && n_rows > 0 && r.row1 <= src->ne[1]);
++
++        ggml_init_params ip = {
++            /*.mem_size   =*/ ggml_tensor_overhead(),
++            /*.mem_buffer =*/ NULL,
++            /*.no_alloc   =*/ true,
++        };
++        ggml_context_ptr ctx { ggml_init(ip) };
++        if (!ctx) {
++            throw std::runtime_error("failed to create the Engram piece context");
++        }
++        ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), src->type, src->ne[0], n_rows);
++        ggml_format_name(t, "%s.piece%zu", src->name, p);
++        GGML_ASSERT(t->nb[1] == row_bytes);
++
++        const size_t n_bytes = (size_t) n_rows*row_bytes;
++        LLAMA_LOG_INFO("%s: Engram piece %zu: rows [%" PRId64 ", %" PRId64 ") = %.2f GiB -> %s\n", __func__, p, r.row0, r.row1,
++                n_bytes/1024.0/1024.0/1024.0, ggml_backend_dev_name(r.dev));
++
++        adopt_weights(std::move(ctx), ggml_backend_dev_buffer_type(r.dev));
++
++        if (!params.no_alloc) {
++            // streamed: the source may be a lazily mapped file much larger than the host RAM
++            const bool   host = src->data && src->buffer && ggml_backend_buffer_is_host(src->buffer);
++            const size_t base = (size_t) r.row0*row_bytes;
++            const size_t step = 64ull*1024*1024;
++            const int64_t t0  = ggml_time_us();
++            for (size_t o = 0; o < n_bytes; o += step) {
++                const size_t n = std::min(step, n_bytes - o);
++                if (host) {
++                    ggml_backend_tensor_set(t, (const char *) src->data + base + o, o, n);
++                } else {
++                    tmp.resize(n);
++                    ggml_backend_tensor_get(src, tmp.data(), base + o, n);
++                    ggml_backend_tensor_set(t, tmp.data(), o, n);
++                }
++            }
++            LLAMA_LOG_INFO("%s: Engram piece %zu copied in %.1f s\n", __func__, p, (ggml_time_us() - t0)/1e6);
++        }
++
++        engram_pieces.push_back({ t, r.row0 });
++    }
++
++    for (size_t e = 0; e < hparams.ple_n_modules; ++e) {
++        auto & groups = engram_groups[e];
++        for (size_t col = 0; col < n_cols; ++col) {
++            const int p = piece_of[e*n_cols + col];
++            if (groups.empty() || groups.back().piece != p) {
++                groups.push_back({ p, (int) col, 1 });
++            } else {
++                groups.back().n_cols++;
++            }
++        }
++    }
++
++    // the host copy is no longer read
++    can_prefetch.erase(per_layer_tok_embd);
++}
++
+ // Engram n-gram hash (engram.py NgramHashState.forward)
+ int llama_model_deepseek41::engram_index(int il) const {
+     if (hparams.ple_n_heads == 0 || !hparams.is_ple(il)) {
+@@ -289,6 +450,8 @@ public:
+     bool can_reuse(const llm_graph_params & params) override;
+ 
+     std::vector<ggml_tensor *> engram_ids;
++    // per engram_ids entry: its Engram layer and, when the table is cut into pieces, its head group (-1: all heads)
++    std::vector<std::pair<int, int>> engram_src;
+     ggml_tensor * engram_keep = nullptr;    // 0 for embedding (image) tokens; only in mixed ubatches
+     ggml_tensor * cand_pin = nullptr;
+     bool cand_csa = false;
+@@ -308,19 +471,38 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
+         std::vector<llama_token> prev;
+         mctx->get_raw()->get_prev_tokens(*ubatch, model.hparams.ple_ngram_size - 1, prev);
+         // hash all Engram layers first so a lazily read table gets one batched readahead before the first gather
+-        std::vector<std::vector<int32_t>> ids(engram_ids.size());
++        const size_t n_e    = model.hparams.ple_n_modules;
++        const size_t n_cols = model.hparams.ple_n_heads;
++        std::vector<std::vector<int32_t>> ids(n_e);
+         std::vector<int32_t> all;
+-        for (size_t e = 0; e < engram_ids.size(); ++e) {
++        for (size_t e = 0; e < n_e; ++e) {
+             model.engram_hash((int) e, *ubatch, prev, ids[e]);
+             all.insert(all.end(), ids[e].begin(), ids[e].end());
+         }
+         if (model.can_prefetch.count(model.per_layer_tok_embd)) {
+             llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
+         }
+-        for (size_t e = 0; e < engram_ids.size(); ++e) {
+-            if (engram_ids[e]->buffer) {
+-                ggml_backend_tensor_set(engram_ids[e], ids[e].data(), 0, ids[e].size()*sizeof(int32_t));
++        std::vector<int32_t> part;
++        for (size_t k = 0; k < engram_ids.size(); ++k) {
++            if (!engram_ids[k]->buffer) {
++                continue;
++            }
++            const int e = engram_src[k].first;
++            const int g = engram_src[k].second;
++            if (g < 0) {
++                ggml_backend_tensor_set(engram_ids[k], ids[e].data(), 0, ids[e].size()*sizeof(int32_t));
++                continue;
+             }
++            // rows of one piece, relative to its first row
++            const auto & grp  = model.engram_groups[e][g];
++            const int32_t row0 = (int32_t) model.engram_pieces[grp.piece].row0;
++            part.resize((size_t) grp.n_cols*ubatch->n_tokens);
++            for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
++                for (int c = 0; c < grp.n_cols; ++c) {
++                    part[(size_t) i*grp.n_cols + c] = ids[e][(size_t) i*n_cols + grp.col0 + c] - row0;
++                }
++            }
++            ggml_backend_tensor_set(engram_ids[k], part.data(), 0, part.size()*sizeof(int32_t));
+         }
+     }
+ 
+@@ -355,8 +537,11 @@ bool llm_graph_input_dsv41::can_reuse(const llm_graph_params & params) {
+     mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx);
+ 
+     bool res = true;
+-    for (auto * t : engram_ids) {
+-        res &= t->ne[0] == (int64_t) model.hparams.ple_n_heads*params.ubatch.n_tokens;
++    for (size_t k = 0; k < engram_ids.size(); ++k) {
++        const int e = engram_src[k].first;
++        const int g = engram_src[k].second;
++        const int64_t n_cols = g < 0 ? (int64_t) model.hparams.ple_n_heads : model.engram_groups[e][g].n_cols;
++        res &= engram_ids[k]->ne[0] == n_cols*(int64_t) params.ubatch.n_tokens;
+     }
+     res &= (engram_keep != nullptr) == (!engram_ids.empty() && params.ubatch.embd != nullptr);
+     if (engram_keep) {
+@@ -792,13 +977,32 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
+         if (!hparams.is_ple(il)) {
+             continue;
+         }
+-        ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) hparams.ple_n_heads*n_tokens);
+-        ggml_set_name(ids, ("engram_ids-" + std::to_string(il)).c_str());
+-        ggml_set_input(ids);
+-        inp41->engram_ids.push_back(ids);
+-
+-        ggml_tensor * rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, ids);
+-        rows = ggml_reshape_2d(ctx0, rows, hparams.ple_head_dim*hparams.ple_n_heads, n_tokens);
++        const int e = (int) engram_rows.size();
++        ggml_tensor * rows = nullptr;
++        if (model.engram_pieces.empty()) {
++            ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) hparams.ple_n_heads*n_tokens);
++            ggml_set_name(ids, ("engram_ids-" + std::to_string(il)).c_str());
++            ggml_set_input(ids);
++            inp41->engram_ids.push_back(ids);
++            inp41->engram_src.push_back({ e, -1 });
++
++            rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, ids);
++            rows = ggml_reshape_2d(ctx0, rows, hparams.ple_head_dim*hparams.ple_n_heads, n_tokens);
++        } else {
++            // the table lives in device memory, cut between heads: gather each run of heads from its piece
++            const auto & groups = model.engram_groups[e];
++            for (size_t g = 0; g < groups.size(); ++g) {
++                ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) groups[g].n_cols*n_tokens);
++                ggml_set_name(ids, ("engram_ids-" + std::to_string(il) + "." + std::to_string(g)).c_str());
++                ggml_set_input(ids);
++                inp41->engram_ids.push_back(ids);
++                inp41->engram_src.push_back({ e, (int) g });
++
++                ggml_tensor * part = ggml_get_rows(ctx0, model.engram_pieces[groups[g].piece].t, ids);
++                part = ggml_reshape_2d(ctx0, part, (int64_t) hparams.ple_head_dim*groups[g].n_cols, n_tokens);
++                rows = rows ? ggml_concat(ctx0, rows, part, 0) : part;
++            }
++        }
+         cb(rows, "engram_rows", il);
+         ggml_build_forward_expand(gf, rows);
+         engram_rows.push_back(rows);
+diff --git a/src/models/models.h b/src/models/models.h
+index b12642f..de29b35 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1507,6 +1507,24 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
+ 
+     void engram_hash(int e, const llama_ubatch & ubatch, const std::vector<llama_token> & prev, std::vector<int32_t> & out) const;
+ 
++    // LLAMA_DSV41_ENGRAM_DEVICES=CUDA0,CUDA1[,...]: copy the Engram table into device memory, one piece per listed device
++    // (a device may be listed more than once, and a piece may get a share: CUDA0:2,CUDA1:1)
++    // the table is cut between hash heads, so every head gathers from one piece
++    void post_load_tensors() override;
++
++    struct engram_piece {
++        ggml_tensor * t = nullptr;
++        int64_t row0 = 0; // first table row held by this piece
++    };
++    // consecutive heads of one Engram layer that gather from the same piece
++    struct engram_group {
++        int piece  = 0;
++        int col0   = 0;
++        int n_cols = 0;
++    };
++    std::vector<engram_piece>              engram_pieces; // empty: the table stays one host tensor
++    std::vector<std::vector<engram_group>> engram_groups; // per Engram layer
++
+     struct graph : public llama_model_deepseek4::graph {
+         graph(const llm_graph_params & params);
+         // helpers only (no graph built): base of graph_dsv41
